@@ -198,6 +198,43 @@ async def close_attack(ctx, attack_id: int, peak: dict) -> None:
     )
 
 
+async def close_stale_attacks(ctx, *, ttl_s: int = 7200) -> int:
+    """TTL-закрытие зависших записей атак.
+
+    Идея fastnetmon (ban_time=1900): если нода offline и poller не закрыл
+    открытую атаку — закрыть её принудительно через ttl_s секунд, чтобы
+    восстановление работало корректно (ended_at IS NULL != атака навсегда).
+
+    Возвращает количество фактически закрытых записей.
+
+    ⚠️ NOT WIRED: на данный момент функция определена и unit-тестирована,
+    но НЕ вызывается из poller/run-tick. Это осознанно — массовое закрытие
+    атак требует явного TTL-конфига через plugin_settings. Когда/если
+    вызов будет добавлен — ttl_s должен браться из settings с явным дефолтом.
+    """
+    if ttl_s <= 0:
+        # Защита от отрицательного/нулевого ttl: NOW() + 100s (отрицательное
+        # смещение) закрыло бы ВСЕ открытые записи. См. security review #S1.
+        raise ValueError(f"ttl_s must be > 0 (got {ttl_s})")
+    # Возвращаем именно количество закрытых записей (агрегация RETURNING).
+    # ВАЖНО: в SQL ниже не должно быть `LIMIT` — иначе счётчик будет wrong.
+    # ВАЖНО: TTL передаётся как int. asyncpg НЕ делает неявный int→text каст,
+    # поэтому использовать `$1 || ' seconds'` нельзя — будет DataError.
+    # Используем make_interval(secs => $1::int) — безопасный type-cast.
+    # См. review S2-followup: cам бы упал на первом тике.
+    row = await ctx.db.fetchrow(
+        "WITH closed AS ("
+        "  UPDATE ddos_monitoring_attacks "
+        "  SET ended_at = NOW(), peak = COALESCE(peak, '{}'::jsonb) "
+        "  WHERE ended_at IS NULL "
+        "    AND started_at < NOW() - make_interval(secs => $1::int) "
+        "  RETURNING id"
+        ") SELECT count(*)::int AS cnt FROM closed",
+        ttl_s,
+    )
+    return int(row["cnt"]) if row else 0
+
+
 async def update_attack(ctx, attack_id: int, severity: str, peak: dict) -> None:
     await ctx.db.execute(
         "UPDATE ddos_monitoring_attacks SET severity = $2, peak = $3::jsonb WHERE id = $1",

@@ -16,7 +16,7 @@ from typing import Any
 
 logger = logging.getLogger("plugin.ddos-monitoring")
 
-from . import notify  # noqa: E402 — алерты фазы 2
+from . import data, notify  # noqa: E402 — модульные зависимости
 
 INTERVAL_S = 20
 TICK_TIMEOUT_S = 15.0
@@ -143,12 +143,95 @@ SUMMARY_INTERVAL_S = 3600.0
 # Пороги агентских метрик
 AGENT_SYN_RECV_LIMIT = 1000       # SYN_RECV в очереди — признак SYN-флуда
 
+# Per-protocol пороги (идея fastnetmon conf: threshold_tcp_mbps / threshold_udp_mbps /
+# threshold_icmp_mbps + per-protocol pps). Дефолты — мягкие, настраиваются через
+# classify_agent(..., *_threshold=...).
+DEFAULT_TCP_MBPS = 100.0     # 100 Мбит/с
+DEFAULT_UDP_MBPS = 100.0
+DEFAULT_ICMP_MBPS = 100.0
+DEFAULT_TCP_PPS = 100_000
+DEFAULT_UDP_PPS = 100_000
+DEFAULT_ICMP_PPS = 100_000
 
-def classify_agent(m: dict[str, Any], *, exclude_vpn: bool = False) -> dict[str, Any]:
+# SYN-rate: рост syn_recv/sec выше порога = SYN-флуд даже при syn_recv < AGENT_SYN_RECV_LIMIT.
+# (медленный DDoS: маленькое абсолютное значение, но быстро растёт)
+DEFAULT_SYN_RATE_THRESHOLD = 50.0  # syn_recv/сек
+
+
+def _mbps(value: Any) -> float:
+    """Перевод байт/с (метрика агента) в Мбит/с для сравнения с порогом."""
+    return _num(value) * 8.0 / 1_000_000.0
+
+
+# Единый источник истины для severity ordering (используется и тестами).
+SEV_ORDER: dict[str, int] = {"warning": 0, "normal": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def classify_syn_rate(
+    prev_syn: int | None,
+    cur_syn: int,
+    interval_s: float,
+    *,
+    threshold: float = DEFAULT_SYN_RATE_THRESHOLD,
+) -> dict[str, Any]:
+    """Вердикт по скорости роста SYN_RECV.
+
+    Идея fastnetmon: ловить «медленный SYN-флуд», когда абсолютное значение
+    syn_recv ещё ниже AGENT_SYN_RECV_LIMIT, но растёт аномально быстро.
+
+    Возвращает {state, attack_type, severity, target, reasons}.
+    """
+    if prev_syn is None or interval_s <= 0:
+        return {"state": "nodata", "attack_type": "", "severity": "normal",
+                "target": "", "reasons": []}
+    delta = float(cur_syn) - float(prev_syn)
+    if delta <= 0:
+        return {"state": "stable", "attack_type": "", "severity": "normal",
+                "target": "", "reasons": []}
+    rate = delta / interval_s
+    if rate >= threshold:
+        # severity: 3× порога → high, 10× → critical
+        if rate >= threshold * 10:
+            sev = "critical"
+        elif rate >= threshold * 3:
+            sev = "high"
+        else:
+            sev = "medium"
+        return {"state": "attack",
+                "attack_type": "TCP SYN-флуд (rate)",
+                "severity": sev,
+                "target": "node",
+                "reasons": [f"SYN_RECV rate: {rate:.0f}/s (порог {threshold:.0f}/s)"]}
+    return {"state": "stable", "attack_type": "", "severity": "normal",
+            "target": "", "reasons": []}
+
+
+def classify_agent(
+    m: dict[str, Any],
+    *,
+    exclude_vpn: bool = False,
+    tcp_mbps_threshold: float = DEFAULT_TCP_MBPS,
+    udp_mbps_threshold: float = DEFAULT_UDP_MBPS,
+    icmp_mbps_threshold: float = DEFAULT_ICMP_MBPS,
+    tcp_pps_threshold: float = DEFAULT_TCP_PPS,
+    udp_pps_threshold: float = DEFAULT_UDP_PPS,
+    icmp_pps_threshold: float = DEFAULT_ICMP_PPS,
+) -> dict[str, Any]:
     """Вердикт по срезу ddos-agent (полные данные: systemd/SYN/per-IP/swap).
 
     exclude_vpn: превышения по легальным VPN-клиентам (m["vpn_ips"]) не
     триггерят атаку — считаются только внешние источники.
+
+    Порядок проверок:
+      1a) per-protocol thresholds (TCP/UDP/ICMP, Мбит/с + pps) — если в
+          метриках агента есть tcp_bytes/udp_bytes/icmp_bytes/tcp_pps/...
+      1b) ip_limit_breaches (легаси) — НЕ атака, а «Лимит IP» в state=health
+      2)  SYN_RECV > AGENT_SYN_RECV_LIMIT → TCP SYN-флуд
+      3)  systemd / Load/RAM/CPU/Swap → state=load/health
+
+    Per-protocol thresholds по умолчанию 100 Мбит/с / 100k pps. Severity
+    считается по ratio = actual/threshold (НЕ hardcoded), так что кастомные
+    пороги через plugin_settings работают корректно.
     """
     if not m:
         return {"state": "nodata", "attack_type": "", "severity": "normal",
@@ -162,6 +245,60 @@ def classify_agent(m: dict[str, Any], *, exclude_vpn: bool = False) -> dict[str,
     breaches = m.get("ip_limit_breaches") or []
     if exclude_vpn and vpn_ips:
         breaches = [b for b in breaches if b.get("ip") not in vpn_ips]
+
+    # 1a) Per-protocol thresholds (идея fastnetmon: threshold_tcp_mbps /
+    # threshold_udp_mbps / threshold_icmp_mbps + per-protocol pps).
+    # Если в метриках есть per-protocol данные — детектим точечно.
+    # severity считается по ratio = actual/threshold (не hardcoded — учитывает
+    # настройки из plugin_settings).
+    proto_reasons: list[str] = []
+    proto_ratios: list[float] = []
+    tcp_mbps_v = _mbps(m.get("tcp_bytes"))
+    udp_mbps_v = _mbps(m.get("udp_bytes"))
+    icmp_mbps_v = _mbps(m.get("icmp_bytes"))
+    tcp_pps_v = _num(m.get("tcp_pps"))
+    udp_pps_v = _num(m.get("udp_pps"))
+    icmp_pps_v = _num(m.get("icmp_pps"))
+    # Проверяем bandwidth
+    if udp_mbps_threshold > 0 and udp_mbps_v >= udp_mbps_threshold:
+        proto_reasons.append(f"UDP flood: {udp_mbps_v:.0f} Мбит/с")
+        proto_ratios.append(udp_mbps_v / udp_mbps_threshold)
+    if tcp_mbps_threshold > 0 and tcp_mbps_v >= tcp_mbps_threshold:
+        proto_reasons.append(f"TCP flood: {tcp_mbps_v:.0f} Мбит/с")
+        proto_ratios.append(tcp_mbps_v / tcp_mbps_threshold)
+    if icmp_mbps_threshold > 0 and icmp_mbps_v >= icmp_mbps_threshold:
+        proto_reasons.append(f"ICMP flood: {icmp_mbps_v:.0f} Мбит/с")
+        proto_ratios.append(icmp_mbps_v / icmp_mbps_threshold)
+    # Проверяем pps
+    if udp_pps_threshold > 0 and udp_pps_v >= udp_pps_threshold:
+        proto_reasons.append(f"UDP flood: {udp_pps_v:.0f} pps")
+        proto_ratios.append(udp_pps_v / udp_pps_threshold)
+    if tcp_pps_threshold > 0 and tcp_pps_v >= tcp_pps_threshold:
+        proto_reasons.append(f"TCP flood: {tcp_pps_v:.0f} pps")
+        proto_ratios.append(tcp_pps_v / tcp_pps_threshold)
+    if icmp_pps_threshold > 0 and icmp_pps_v >= icmp_pps_threshold:
+        proto_reasons.append(f"ICMP flood: {icmp_pps_v:.0f} pps")
+        proto_ratios.append(icmp_pps_v / icmp_pps_threshold)
+    if proto_reasons:
+        # severity по максимальному превышению порога (НЕ hardcoded divisors)
+        max_ratio = max(proto_ratios)
+        if max_ratio >= 3.0:
+            proto_severity = "critical"
+        elif max_ratio >= 1.5:
+            proto_severity = "high"
+        else:
+            proto_severity = "medium"
+        # Определяем основной тип
+        if any("UDP" in r for r in proto_reasons):
+            attack_type = "UDP-флуд"
+        elif any("ICMP" in r for r in proto_reasons):
+            attack_type = "ICMP-флуд"
+        else:
+            attack_type = "TCP-флуд"
+        return {"state": "attack", "attack_type": attack_type,
+                "severity": proto_severity, "target": "node",
+                "reasons": proto_reasons}
+
     # 2) SYN_RECV — очередь полуоткрытых соединений
     syn = int(_num(m.get("syn_recv")))
     if syn >= AGENT_SYN_RECV_LIMIT:
@@ -235,6 +372,7 @@ class DdosPoller:
         self._startup_summary_sent = False
         self._restored = False
         self._restore_task: Any = None
+        self._last_stale_close: float = 0.0  # rate-limit для close_stale_attacks
 
     # ── публичное состояние для /data ────────────────────────────────
     def public_state(self) -> dict[str, Any]:
@@ -245,6 +383,44 @@ class DdosPoller:
             "stale": self.as_of is None or (time.time() - self.as_of) > STALE_AFTER_S,
             "nodes_monitored": len(self._nodes),
         }
+
+    # ── TTL-закрытие зависших атак (S.2) ─────────────────────────────
+    # Wire L1: close_stale_attacks() теперь вызывается из _tick_impl()
+    # с rate-limit (раз в час). Контролируется через plugin_settings →
+    # attack_stale_ttl_s. Дефолт 0 = ВЫКЛЮЧЕНО (безопасный старт).
+    STALE_CLOSE_INTERVAL_S = 3600.0
+
+    async def _maybe_close_stale(self, ctx, log: Any) -> int:
+        """TTL-закрытие висящих attacks. Защита от mass-close:
+        - attack_stale_ttl_s=0/missing → НЕ вызывается
+        - attack_stale_ttl_s<0 → НЕ вызывается (защита)
+        - rate-limit: не чаще чем раз в STALE_CLOSE_INTERVAL_S
+        - DB-ошибка НЕ валит tick
+        Возвращает количество закрытых записей (для логирования)."""
+        try:
+            raw = await self._fetch(ctx.settings.get("attack_stale_ttl_s"))
+        except Exception:
+            log.warning("ddos-monitoring: failed to read attack_stale_ttl_s", exc_info=True)
+            return 0
+        try:
+            ttl = int(raw) if raw is not None and str(raw).strip() else 0
+        except (TypeError, ValueError):
+            log.warning("ddos-monitoring: attack_stale_ttl_s=%r не int — пропуск", raw)
+            return 0
+        if ttl <= 0:
+            return 0
+        if time.time() - self._last_stale_close < self.STALE_CLOSE_INTERVAL_S:
+            return 0
+        self._last_stale_close = time.time()
+        from . import data
+        try:
+            n = await data.close_stale_attacks(ctx, ttl_s=ttl)
+            if n:
+                log.info("ddos-monitoring: closed %d stale attacks (ttl=%ds)", n, ttl)
+            return n
+        except Exception:
+            log.warning("ddos-monitoring: close_stale_attacks failed", exc_info=True)
+            return 0
 
     def _fail(self, code: str, log: Any, msg: str, *args: Any, exc_info: bool = False) -> None:
         self.failures += 1
@@ -386,6 +562,25 @@ class DdosPoller:
                 if exclude_vpn:
                     agent_m["vpn_ips"] = vpn_ips
                 verdict = classify_agent(agent_m, exclude_vpn=exclude_vpn)
+
+                # S.3 — SYN-rate (идея fastnetmon: ловить медленный SYN-флуд,
+                # когда абсолютное значение ещё ниже AGENT_SYN_RECV_LIMIT, но
+                # быстро растёт). Использует прошлое значение из self._nodes.
+                if agent_m.get("syn_recv") is not None:
+                    cur_syn = int(_num(agent_m["syn_recv"]))
+                    last_syn = self._nodes.get(uuid, {}).get("last_syn_recv")
+                    interval = INTERVAL_S if last_syn is not None else 0.0
+                    rate_verdict = classify_syn_rate(
+                        last_syn, cur_syn, interval,
+                        threshold=DEFAULT_SYN_RATE_THRESHOLD,
+                    )
+                    # Если SYN-rate детектит атаку, перебиваем verdict
+                    # (но только если текущий вердикт НЕ атака с более высоким severity)
+                    if rate_verdict["state"] == "attack":
+                        cur_sev = verdict.get("severity", "normal")
+                        rate_sev = rate_verdict["severity"]
+                        if SEV_ORDER.get(rate_sev, 0) > SEV_ORDER.get(cur_sev, 0):
+                            verdict = rate_verdict
                 metrics = self._agent_to_panel(agent_m)
                 metrics["source"] = "agent"
             else:
@@ -402,6 +597,9 @@ class DdosPoller:
                 metrics["source"] = "panel"
             if uuid in self._nodes:
                 self._nodes[uuid]["name"] = node_names.get(uuid, "")
+                # Сохраняем cur_syn для следующего тика (S.3 rate detection)
+                if agent_m is not None and agent_m.get("syn_recv") is not None:
+                    self._nodes[uuid]["last_syn_recv"] = int(_num(agent_m["syn_recv"]))
             agent_version = None
             if agent_m is not None:
                 from . import agent_receiver as AR
@@ -421,6 +619,9 @@ class DdosPoller:
                 entry["verdict"] = entry.get("verdict", "nodata")
                 await data.record_sample(ctx, uuid, node_names.get(uuid, ""), None,
                                          "no telemetry" if entry["verdict"] != "offline" else None)
+
+        # TTL-закрытие зависших attacks (wire L1) — раз в час
+        await self._maybe_close_stale(ctx, log)
 
         self.as_of = now
         self.error = None
