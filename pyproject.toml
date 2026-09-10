@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ddos-monitoring"
+version = "0.7.33"
+description = "DDoS-мониторинг для remnawave-admin: телеметрия нод, детект атак, история, TG-алерты"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "kod" }]
+requires-python = ">=3.11"
+dependencies = ["aiohttp>=3.9"]
+keywords = ["remnawave", "remnawave-admin", "plugin", "ddos", "monitoring"]
+
+[project.entry-points."rwa.plugin"]
+ddos_monitoring = "ddos_monitoring:manifest"
+
+[tool.setuptools]
+packages = ["ddos_monitoring"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = ["E501", "B008"]
