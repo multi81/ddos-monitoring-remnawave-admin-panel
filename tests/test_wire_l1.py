@@ -40,7 +40,6 @@ class _StubDB:
         self.raise_exc = raise_exc
         self.calls: list[tuple] = []
     async def fetchval(self, sql, *args):
-        from unittest.mock import MagicMock
         self.calls.append((sql, args))
         if self.raise_exc:
             raise RuntimeError("simulated DB failure")

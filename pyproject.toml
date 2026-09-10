@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ddos-monitoring"
-version = "0.7.33"
+version = "0.7.35"
 description = "DDoS-мониторинг для remnawave-admin: телеметрия нод, детект атак, история, TG-алерты"
 readme = "README.md"
 license = { text = "MIT" }
@@ -23,6 +23,9 @@ packages = ["ddos_monitoring"]
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+markers = [
+    "slow: интеграционные тесты, требуют реальный Postgres на localhost:54321 (запускать через `RUN_SLOW=1`)",
+]
 
 [tool.ruff]
 line-length = 120

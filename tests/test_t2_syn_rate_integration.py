@@ -13,10 +13,9 @@ import pytest
 
 
 # Импорт модуля
-import ddos_monitoring.poller as poller_mod
 from ddos_monitoring.poller import (
     classify_syn_rate, classify_agent,
-    DEFAULT_SYN_RATE_THRESHOLD, INTERVAL_S, SEV_ORDER,
+    INTERVAL_S, SEV_ORDER,
 )
 
 

@@ -399,7 +399,7 @@ class DdosPoller:
         Возвращает количество закрытых записей (для логирования)."""
         try:
             raw = await self._fetch(ctx.settings.get("attack_stale_ttl_s"))
-        except Exception:
+        except Exception:  # noqa: BLE001 — tick не должен падать на сбое settings
             log.warning("ddos-monitoring: failed to read attack_stale_ttl_s", exc_info=True)
             return 0
         try:
@@ -411,14 +411,14 @@ class DdosPoller:
             return 0
         if time.time() - self._last_stale_close < self.STALE_CLOSE_INTERVAL_S:
             return 0
-        self._last_stale_close = time.time()
         from . import data
+        self._last_stale_close = time.time()
         try:
             n = await data.close_stale_attacks(ctx, ttl_s=ttl)
             if n:
                 log.info("ddos-monitoring: closed %d stale attacks (ttl=%ds)", n, ttl)
             return n
-        except Exception:
+        except Exception:  # noqa: BLE001 — tick не должен падать на DB-сбое
             log.warning("ddos-monitoring: close_stale_attacks failed", exc_info=True)
             return 0
 
@@ -649,6 +649,16 @@ class DdosPoller:
             return
         previous, entry["verdict"] = entry["verdict"], "offline"
         entry["candidate"], entry["candidate_count"] = "", 0
+        # Закрыть открытую атаку (если была) — иначе БД-строка зависнет
+        # до attack_stale_ttl_s. Это явный offline transition.
+        attack_id = entry.get("attack_id")
+        if attack_id is not None:
+            from . import data
+            try:
+                await data.close_attack(ctx, attack_id, entry.get("peak") or {})
+            except Exception:  # noqa: BLE001 — tick не должен падать на DB-сбое
+                log.warning("ddos-monitoring: close_attack on offline failed", exc_info=True)
+            entry["attack_id"] = None
         await notify.send_state_change(ctx, uuid, name or uuid,
                                        previous=previous,
                                        current={"state": "offline"},
