@@ -1,0 +1,2 @@
+[rwa.plugin]
+ddos_monitoring = ddos_monitoring:manifest

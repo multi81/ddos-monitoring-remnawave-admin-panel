@@ -1,0 +1,437 @@
+"""Схема и доступ к данным плагина.
+
+Свои таблицы — с префиксом ddos_monitoring_*. DDL идемпотентный (IF NOT EXISTS),
+применяется самим плагином при первом тике: у панели Plugin API v1 нет
+штатного механизма миграций плагинов. Версия схемы фиксируется в
+ddos_monitoring_schema_version.
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import time
+from typing import Any
+
+SCHEMA_VERSION = 2
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS ddos_monitoring_node_state (
+    node_uuid UUID PRIMARY KEY,
+    node_name TEXT NOT NULL DEFAULT '',
+    agent_version TEXT,
+    last_seen_at TIMESTAMPTZ,
+    last_error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ddos_monitoring_attacks (
+    id BIGSERIAL PRIMARY KEY,
+    node_uuid UUID NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at TIMESTAMPTZ,
+    attack_type TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    target TEXT NOT NULL DEFAULT '',
+    reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    peak JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_ddos_monitoring_attacks_node_started
+    ON ddos_monitoring_attacks(node_uuid, started_at);
+
+CREATE TABLE IF NOT EXISTS ddos_monitoring_strikes (
+    id BIGSERIAL PRIMARY KEY,
+    node_uuid UUID NOT NULL,
+    attack_id BIGINT REFERENCES ddos_monitoring_attacks(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,               -- strike | quarantine | recover
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ddos_monitoring_strikes_node_created
+    ON ddos_monitoring_strikes(node_uuid, created_at);
+
+CREATE TABLE IF NOT EXISTS ddos_monitoring_events (
+    id BIGSERIAL PRIMARY KEY,
+    node_uuid UUID,
+    kind TEXT NOT NULL,               -- attack_start | attack_end | load | health | offline | alert_failed...
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ddos_monitoring_events_created
+    ON ddos_monitoring_events(created_at);
+
+ALTER TABLE ddos_monitoring_node_state
+    ADD COLUMN IF NOT EXISTS agent_version TEXT;
+"""
+
+
+VPN_WINDOW_S = 900  # окно «активного» VPN-IP: активная или свежая сессия
+
+
+async def get_vpn_ip_map(ctx, window_s: int = VPN_WINDOW_S) -> dict:
+    """Активные VPN-IP панели → {ip: is_vpn(True)}.
+
+    Источник — user_connections (ConnectionReport нод-агентов): активные
+    сессии (disconnected_at IS NULL) либо закрывшиеся недавно (окно).
+    Значение — только булево: email пользователей наружу map не отдаётся
+    (приватность; email нужен был только для факта «легальный клиент»).
+    Ошибки БД глотаются → пустой map (фильтр просто не сработает).
+    """
+    try:
+        rows = await ctx.db.fetch(
+            """
+            SELECT uc.ip_address
+            FROM user_connections uc
+            WHERE uc.ip_address IS NOT NULL AND uc.ip_address <> ''
+              AND (uc.disconnected_at IS NULL
+                   OR uc.disconnected_at > now() - ($1 || ' seconds')::interval)
+            """,
+            str(int(window_s)),
+        )
+    except Exception:
+        return {}
+    out: dict = {}
+    for r in rows or []:
+        ip = (r.get("ip_address") if hasattr(r, "get") else r["ip_address"]) or ""
+        if ip:
+            out[ip] = True
+    return out
+
+
+async def top_sources(ctx, limit: int = 50,
+                      window_s: int = VPN_WINDOW_S) -> list[dict]:
+    """Топ источников атак (из payload.attack_start.top_ips) + vpn?/email.
+
+    Email возвращается ТОЛЬКО для UI под ddos:view_ips — в TG не идёт.
+    """
+    try:
+        rows = await ctx.db.fetch(
+            """
+            SELECT e->>'ip' AS ip_address, sum((e->>'count')::bigint) AS cnt,
+                   min(ev.created_at) AS first_seen
+            FROM ddos_monitoring_events ev,
+                 jsonb_array_elements(ev.payload->'top_ips') e
+            WHERE ev.kind = 'attack_start'
+              AND ev.created_at > now() - ($1 || ' seconds')::interval
+            GROUP BY e->>'ip'
+            ORDER BY cnt DESC
+            LIMIT $2
+            """,
+            str(int(window_s)), int(limit),
+        )
+    except Exception:
+        return []
+    vpn_map = await get_vpn_ip_map(ctx, window_s=window_s)
+    out: list[dict] = []
+    for r in rows or []:
+        get = r.get if hasattr(r, "get") else (lambda k: r[k])
+        ip = get("ip_address")
+        if not ip:
+            continue
+        is_vpn = bool(vpn_map.get(ip))
+        out.append({
+            "ip": ip,
+            "count": int(get("cnt") or 0),
+            "vpn": is_vpn,
+            "is_vpn": is_vpn,
+            "email": None,
+            "first_seen": str(get("first_seen") or ""),
+        })
+    return out
+
+
+async def ensure_schema(ctx) -> None:
+    """Идемпотентное применение DDL + журнал версии. Вызывается из тика."""
+    applied = await ctx.db.fetchval(
+        "SELECT value FROM plugin_settings WHERE plugin_id = $1 AND key = $2",
+        ctx.plugin_id, "schema_version",
+    )
+    if applied is not None and int(applied) >= SCHEMA_VERSION:
+        return
+    await ctx.db.execute(_DDL)
+    await ctx.db.execute(
+        """INSERT INTO plugin_settings (plugin_id, key, value, updated_at)
+           VALUES ($1, 'schema_version', $2::jsonb, NOW())
+           ON CONFLICT (plugin_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+        ctx.plugin_id, str(SCHEMA_VERSION),
+    )
+
+
+async def record_sample(ctx, node_uuid: str, node_name: str, snapshot: dict | None,
+                        error: str | None, agent_version: str | None = None) -> None:
+    await ctx.db.execute(
+        """INSERT INTO ddos_monitoring_node_state
+                    (node_uuid, node_name, agent_version, last_seen_at, last_error, updated_at)
+           VALUES ($1, $2, $3, $4, $5, NOW())
+           ON CONFLICT (node_uuid) DO UPDATE SET
+               node_name = EXCLUDED.node_name,
+               agent_version = COALESCE(EXCLUDED.agent_version,
+                                        ddos_monitoring_node_state.agent_version),
+               last_seen_at = EXCLUDED.last_seen_at,
+               last_error = EXCLUDED.last_error,
+               updated_at = NOW()""",
+        node_uuid, node_name, agent_version,
+        datetime.datetime.now(datetime.timezone.utc) if snapshot else None,
+        error,
+    )
+
+
+async def open_attack(ctx, node_uuid: str, assessment: dict) -> int:
+    # Закрываем висящие открытые атаки той же ноды (после рестартов панели
+    # могли накапливаться дубли с ended_at IS NULL).
+    await ctx.db.execute(
+        "UPDATE ddos_monitoring_attacks SET ended_at = NOW() "
+        "WHERE node_uuid = $1 AND ended_at IS NULL",
+        node_uuid,
+    )
+    return int((await ctx.db.fetchrow(
+        """INSERT INTO ddos_monitoring_attacks (node_uuid, attack_type, severity, target, reasons)
+           VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id""",
+        node_uuid, assessment["attack_type"], assessment["severity"],
+        assessment["target"], _json_list(assessment.get("reasons")),
+    ))["id"])
+
+
+async def close_attack(ctx, attack_id: int, peak: dict) -> None:
+    await ctx.db.execute(
+        "UPDATE ddos_monitoring_attacks SET ended_at = NOW(), peak = $2::jsonb WHERE id = $1 AND ended_at IS NULL",
+        attack_id, _json_obj(peak),
+    )
+
+
+async def update_attack(ctx, attack_id: int, severity: str, peak: dict) -> None:
+    await ctx.db.execute(
+        "UPDATE ddos_monitoring_attacks SET severity = $2, peak = $3::jsonb WHERE id = $1",
+        attack_id, severity, _json_obj(peak),
+    )
+
+
+async def add_event(ctx, kind: str, node_uuid: str | None, payload: dict) -> None:
+    await ctx.db.execute(
+        "INSERT INTO ddos_monitoring_events (node_uuid, kind, payload) VALUES ($1, $2, $3::jsonb)",
+        node_uuid, kind, _json_obj(payload),
+    )
+
+
+def _json_obj(value: dict | None) -> str:
+    return json.dumps(value or {}, ensure_ascii=False)
+
+
+def _json_list(value: list | tuple | None) -> str:
+    return json.dumps(list(value or []), ensure_ascii=False)
+
+
+# ── чтение для /data ─────────────────────────────────────────────
+
+async def fleet_overview(ctx) -> list[dict[str, Any]]:
+    rows = await ctx.db.fetch(
+        """SELECT s.node_uuid, s.node_name,
+                  COALESCE(NULLIF(st.agent_version, ''), s.agent_version) AS agent_version,
+                  COALESCE(to_timestamp(st.last_seen), s.last_seen_at) AS last_seen_at,
+                  s.last_error,
+                  a.id AS attack_id, a.started_at AS attack_started, a.attack_type,
+                  a.severity, a.target
+           FROM ddos_monitoring_node_state s
+           LEFT JOIN ddos_monitoring_agent_status st
+             ON st.node_uuid = s.node_uuid
+           LEFT JOIN LATERAL (
+               SELECT id, started_at, attack_type, severity, target
+               FROM ddos_monitoring_attacks
+               WHERE node_uuid = s.node_uuid AND ended_at IS NULL
+               ORDER BY started_at DESC LIMIT 1
+           ) a ON TRUE
+           ORDER BY s.node_name, s.node_uuid""")
+    return [dict(r) for r in rows]
+
+
+# ── Расшифровка для человека: известные systemd-юниты ────────────
+UNIT_HINTS: dict[str, tuple[str, str]] = {
+    "antiscan-move-rules.service": (
+        "Анти-скан защита: переносит правила блокировки сканеров в firewall",
+        "Юнит упал — правила сканеров могли не примениться. На ноде: "
+        "`systemctl status antiscan-move-rules` → посмотреть причину, "
+        "`systemctl restart antiscan-move-rules`. Если падает постоянно — "
+        "проверить логи `journalctl -u antiscan-move-rules -n 50`."),
+    "zramswap.service": (
+        "Сжатый swap в RAM (zram) — ускоряет работу при нехватке памяти",
+        "Юнит упал — zram-swap не создан, при пиках памяти возможны тормоза. "
+        "На ноде: `systemctl restart zramswap`, проверить "
+        "`journalctl -u zramswap -n 30`. Частая причина — модуль zram "
+        "не загружен ядром (`modprobe zram`)."),
+    "xray.service": (
+        "Ядро Xray (прокси/транспорт VPN-трафика)",
+        "КРИТИЧНО: без xray нода не обслуживает клиентов. "
+        "`systemctl status xray`, `journalctl -u xray -n 50`. "
+        "Частые причины: битый конфиг (xray -test -c …), занят порт, "
+        "закончились ресурсы."),
+    "fail2ban.service": (
+        "Автобан перебора паролей/сканеров по логам",
+        "Защита от брутфорса не работает. `systemctl restart fail2ban`; "
+        "если падает — `journalctl -u fail2ban -n 30`, обычно проблема "
+        "в конфиге jail или отсутствии log-файла."),
+    "nginx.service": (
+        "Веб-сервер/реверс-прокси на ноде",
+        "Сайты/прокси на ноде недоступны. `nginx -t` (тест конфига), "
+        "`systemctl restart nginx`, `journalctl -u nginx -n 30`."),
+    "docker.service": (
+        "Docker — контейнеры сервисов на ноде",
+        "КРИТИЧНО: все контейнеры на ноде остановлены. "
+        "`systemctl restart docker`, затем `docker ps` — проверить контейнеры."),
+}
+
+
+def unit_hint(name: str) -> dict[str, str]:
+    """Человеческая расшифровка systemd-юнита; для неизвестных — общий совет."""
+    base = name.removesuffix(".service")
+    for key, (what, todo) in UNIT_HINTS.items():
+        if name == key or base.startswith(key.removesuffix(".service")):
+            return {"what": what, "todo": todo}
+    return {
+        "what": f"Системный сервис «{base}»",
+        "todo": ("Юнит в статусе failed. На ноде: `systemctl status " + base +
+                 "` и `journalctl -u " + base + " -n 30` — посмотреть причину; "
+                 "`systemctl restart " + base + "` после исправления. "
+                 "Если сервис не нужен — `systemctl disable --now " + base + "`."),
+    }
+
+
+# Расшифровка видов причин
+REASON_HINTS = {
+    "systemd": "Сбой системных сервисов",
+    "ip_limit": "Один или несколько IP держат слишком много соединений",
+    "syn": "Переполнена очередь полуоткрытых SYN-соединений (признак SYN-flood)",
+    "load": "Нода перегружена",
+    "disk": "Заканчивается место на диске",
+    "swap": "Заканчивается swap",
+    "offline": "Агент не присылает телеметрию",
+}
+
+VERDICT_HINTS = {
+    "attack": ("🔴 Атака", "Обнаружен аномальный трафик (SYN-flood / объём). "
+               "Проверить топ источников, при необходимости включить защиту на границе."),
+    "load": ("🟠 Высокая нагрузка", "CPU/RAM/Load за порогом. Проверить процессы "
+             "`top`, перезапустить тяжёлые сервисы, масштабировать ноду."),
+    "health": ("🟡 Требует внимания", "Не атака, но есть сбои (упавшие сервисы, "
+               "жадные IP). Разберитесь по пунктам ниже — каждый пункт содержит, "
+               "что делать."),
+    "offline": ("⚫️ Нет связи", "Агент на ноде молчит >1 мин: нода выключена, "
+                "нет сети или агент остановлен. Проверить `systemctl status ddos-agent`."),
+    "stable": ("🟢 Стабильно", "Все метрики в норме."),
+}
+
+
+async def node_details(ctx) -> list[dict[str, Any]]:
+    """Расшифровка вердикта по каждой ноде: systemd-юниты, топ нарушителей
+    лимита соединений, SYN/Load/RAM/Swap/Диск — из последнего снапшота."""
+    from .poller import POLLER, DEFAULT_THRESHOLDS
+
+    snaps = await ctx.db.fetch(
+        """SELECT DISTINCT ON (node_uuid) node_uuid, ts, syn_recv, established,
+                  cpu_pct, ram_pct, load1, cores, swap_pct, disk_pct,
+                  failed_units, ip_limit_breaches
+           FROM ddos_monitoring_agent_snapshots
+           ORDER BY node_uuid, ts DESC""")
+    verdicts = {str(u): v.get("verdict") for u, v in POLLER._nodes.items()}
+
+    out = []
+    for s in snaps:
+        fu = s["failed_units"]
+        if isinstance(fu, str):
+            fu = json.loads(fu)
+        br = s["ip_limit_breaches"]
+        if isinstance(br, str):
+            br = json.loads(br)
+        top = sorted(br or [], key=lambda b: -int(b.get("count", 0)))[:10]
+        reasons = []
+        if fu:
+            reasons.append({"kind": "systemd",
+                            "text": "упавшие systemd-юниты",
+                            "hint": REASON_HINTS["systemd"],
+                            "items": [dict(unit_hint(u), unit=u) for u in fu if u]})
+        if top:
+            reasons.append({
+                "kind": "ip_limit",
+                "text": "Лимит IP: превышение соединений per-IP (НЕ атака)",
+                "hint": REASON_HINTS["ip_limit"] + ". По калибровке это 🟡, "
+                        "а не атака; при желании забанить — на ноде "
+                        "`iptables -A INPUT -s <IP> -j DROP`.",
+                "items": [f"{b.get('ip')} — {b.get('count')} соед." for b in top],
+                "total_ips": len(br or []),
+            })
+        cpus = max(int(s["cores"] or 1), 1)
+        load_ratio = (float(s["load1"] or 0) / cpus / DEFAULT_THRESHOLDS["load_per_cpu"]) if DEFAULT_THRESHOLDS["load_per_cpu"] else 0
+        metrics = {
+            "syn_recv": int(s["syn_recv"] or 0),
+            "established": int(s["established"] or 0),
+            "cpu_pct": float(s["cpu_pct"] or 0),
+            "ram_pct": float(s["ram_pct"] or 0),
+            "swap_pct": float(s["swap_pct"] or 0),
+            "disk_pct": round(float(s["disk_pct"] or 0), 1),
+        }
+        if metrics["syn_recv"] >= 1000:
+            reasons.insert(0, {"kind": "syn", "text": "SYN-очередь переполнена",
+                               "hint": REASON_HINTS["syn"],
+                               "items": [f"SYN_RECV = {metrics['syn_recv']}. "
+                                         "Проверить: `ss -s`; смягчить — включить "
+                                         "syncookies (`sysctl net.ipv4.tcp_syncookies=1`)"]})
+        for key, label, th in (("cpu_pct", "CPU", "cpu_percent"),
+                               ("ram_pct", "RAM", "memory_percent")):
+            if DEFAULT_THRESHOLDS[th] and metrics[key] >= DEFAULT_THRESHOLDS[th]:
+                reasons.append({"kind": "load", "text": f"Высокая нагрузка · {label}",
+                                "hint": REASON_HINTS["load"],
+                                "items": [f"{label} = {metrics[key]:.0f}% (порог "
+                                          f"{DEFAULT_THRESHOLDS[th]:.0f}%). На ноде: "
+                                          "`top` → найти прожорливый процесс."]})
+        if metrics["disk_pct"] >= 90:
+            reasons.append({"kind": "disk", "text": "Диск почти заполнен",
+                            "hint": REASON_HINTS["disk"],
+                            "items": [f"Диск = {metrics['disk_pct']}%. На ноде: "
+                                      "`df -h`, чистить логи (`journalctl --vacuum-size=100M`)"]})
+        if metrics["swap_pct"] >= 90:
+            reasons.append({"kind": "swap", "text": "Swap исчерпан",
+                            "hint": REASON_HINTS["swap"],
+                            "items": [f"Swap = {metrics['swap_pct']:.0f}%. Ноде не хватает "
+                                      "памяти: проверить `free -h`, добавить RAM или zram"]})
+
+        out.append({
+            "node_uuid": str(s["node_uuid"]),
+            "verdict": verdicts.get(str(s["node_uuid"]), "unknown"),
+            "verdict_hint": VERDICT_HINTS.get(
+                verdicts.get(str(s["node_uuid"]), ""), ("…", ""))[1],
+            "snapshot_age_s": int(time.time() - s["ts"]),
+            "reasons": reasons,
+            "metrics": metrics,
+        })
+    # Ноды без снапшотов вообще → нет связи
+    known = {r["node_uuid"] for r in out}
+    states = await ctx.db.fetch("SELECT node_uuid FROM ddos_monitoring_node_state")
+    for r in states:
+        u = str(r["node_uuid"])
+        if u not in known:
+            out.append({"node_uuid": u, "verdict": "offline",
+                        "snapshot_age_s": None, "reasons":
+                        [{"kind": "offline", "text": "Нет связи",
+                          "hint": REASON_HINTS["offline"],
+                          "items": ["Агент не присылает телеметрию. На ноде: "
+                                    "`systemctl status ddos-agent`; если остановлен — "
+                                    "`systemctl restart ddos-agent`"]}],
+                        "metrics": {}})
+    return out
+
+
+async def recent_attacks(ctx, limit: int = 50) -> list[dict[str, Any]]:
+    rows = await ctx.db.fetch(
+        """SELECT a.id, a.node_uuid, s.node_name, a.started_at, a.ended_at,
+                  a.attack_type, a.severity, a.target, a.reasons, a.peak
+           FROM ddos_monitoring_attacks a
+           LEFT JOIN ddos_monitoring_node_state s ON s.node_uuid = a.node_uuid
+           ORDER BY a.started_at DESC LIMIT $1""", limit)
+    return [dict(r) for r in rows]
+
+
+async def poller_status(ctx) -> dict[str, Any]:
+    from .poller import POLLER
+    return POLLER.public_state()
+
+
+def monotonic_ts() -> float:
+    return time.monotonic()
