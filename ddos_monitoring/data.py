@@ -300,8 +300,74 @@ def _json_list(value: list | tuple | None) -> str:
 
 # ── чтение для /data ─────────────────────────────────────────────
 
-async def fleet_overview(ctx) -> list[dict[str, Any]]:
+async def total_nodes_in_panel(ctx) -> int:
+    """Полное число нод, которые знает панель (Remnawave `public.nodes`).
+
+    Не путать с `fleet_overview()` — здесь ноды со срезами от агентов
+    (онлайн); здесь — все ноды в панели (включая те, что без агента).
+
+    Используется UI KPI «Под наблюдением: N / M» (задача handoff.md #5).
+    """
+    db = getattr(ctx, "db", ctx)
+    row = await db.fetchval(
+        "SELECT COUNT(*)::int FROM public.nodes"
+    )
+    return int(row or 0)
+
+
+# Задачи handoff.md #1 и #2 — добавляем в контекст джойн с agent_snapshots:
+# (используется в fleet_overview ниже через LATERAL).
+def _row_load_pct(cpu_pct: float, syn_recv: int, established: int) -> float:
+    """Считаем "load" ноды по Aria's UI spec (handoff.md #2).
+
+    load = max(cpu_pct, min(100, syn_recv/100), min(100, established/10000))
+
+    Возвращает значение 0..100 (для sparkline).
+    """
+    cpu = float(cpu_pct or 0)
+    syn = min(100.0, max(0.0, syn_recv / 100.0))
+    est = min(100.0, max(0.0, (established or 0) / 10000.0))
+    return round(max(cpu, syn, est), 1)
+
+
+async def _bulk_snapshots(ctx, limit_per_node: int = 9) -> dict[str, list[dict]]:
+    """Один bulk-запрос: последние `limit_per_node` снапшотов для КАЖДОЙ ноды.
+
+    Возвращает {node_uuid_str: [snap_oldest, ..., snap_newest]} — ASC.
+    Используется и для metrics (snap[-1] + snap[-2]), и для history (snap[:-1]).
+
+    Один запрос вместо N+N запросов (N+1 optimization, reviewer suggestion #1).
+    """
     rows = await ctx.db.fetch(
+        """SELECT * FROM (
+               SELECT node_uuid, ts,
+                      cpu_pct, ram_pct, swap_pct, disk_pct,
+                      syn_recv, established, rx_bps, tx_bps,
+                      ROW_NUMBER() OVER (PARTITION BY node_uuid ORDER BY ts DESC) AS rn
+               FROM ddos_monitoring_agent_snapshots
+           ) sub
+           WHERE rn <= $1::int
+           ORDER BY node_uuid, ts ASC""",
+        limit_per_node,
+    )
+    result: dict[str, list[dict]] = {}
+    for r in rows:
+        uuid_str = str(r["node_uuid"])
+        result.setdefault(uuid_str, []).append(dict(r))
+    return result
+
+
+async def fleet_overview(ctx) -> list[dict[str, Any]]:
+    """Список нод с присоединёнными снимками и историей для UI.
+
+    Поля (UI ожидает — задачи handoff.md #1, #2, #5):
+      - node_uuid, node_name, agent_version, last_seen_at, last_error
+      - attack_id, attack_started, attack_type, severity, target
+      - metrics: {cpu_pct, ram_pct, swap_pct, disk_pct, syn_recv, established,
+                  syn_recv_delta_per_s, rx_mbps, tx_mbps}   — ТОЛЬКО если есть снапшот
+      - history: [8 load_pct значений 0..100]                — ТОЛЬКО если есть >=1 снапшот
+    """
+    nodes = await ctx.db.fetch(
         """SELECT s.node_uuid, s.node_name,
                   COALESCE(NULLIF(st.agent_version, ''), s.agent_version) AS agent_version,
                   COALESCE(to_timestamp(st.last_seen), s.last_seen_at) AS last_seen_at,
@@ -318,7 +384,55 @@ async def fleet_overview(ctx) -> list[dict[str, Any]]:
                ORDER BY started_at DESC LIMIT 1
            ) a ON TRUE
            ORDER BY s.node_name, s.node_uuid""")
-    return [dict(r) for r in rows]
+    if not nodes:
+        return []
+    # Один bulk-запрос вместо N+N (reviewer suggestion #1: N+1 optimization)
+    # limit_per_node=9: 1 текущий + 1 для delta + 8 для history
+    all_snaps = await _bulk_snapshots(ctx, limit_per_node=9)
+    out = []
+    for r in nodes:
+        item = dict(r)
+        uuid_str = str(item["node_uuid"])
+        snaps = all_snaps.get(uuid_str, [])
+        if snaps:
+            snap = snaps[-1]  # newest (ASC order)
+            prev = snaps[-2] if len(snaps) >= 2 else None
+            metrics = {
+                "cpu_pct": round(float(snap["cpu_pct"] or 0), 1),
+                "ram_pct": round(float(snap["ram_pct"] or 0), 1),
+                "swap_pct": round(float(snap["swap_pct"] or 0), 1),
+                "disk_pct": round(float(snap["disk_pct"] or 0), 1),
+                "syn_recv": int(snap["syn_recv"] or 0),
+                "established": int(snap["established"] or 0),
+                "rx_mbps": round(int(snap["rx_bps"] or 0) / 1_000_000, 1),
+                "tx_mbps": round(int(snap["tx_bps"] or 0) / 1_000_000, 1),
+            }
+            # syn_recv_delta_per_s — prev уже есть в bulk-результате
+            if prev is not None and int(snap["ts"]) > int(prev["ts"]):
+                dt_s = int(snap["ts"]) - int(prev["ts"])
+                if dt_s > 0:
+                    delta = int(snap["syn_recv"] or 0) - int(prev["syn_recv"] or 0)
+                    metrics["syn_recv_delta_per_s"] = round(delta / dt_s, 1)
+                else:
+                    metrics["syn_recv_delta_per_s"] = 0.0
+            else:
+                metrics["syn_recv_delta_per_s"] = 0.0
+            item["metrics"] = metrics
+            # history = все кроме самого нового (последнего) → load для sparkline
+            history_snaps = snaps[:-1] if len(snaps) >= 2 else []
+            item["history"] = [
+                _row_load_pct(
+                    float(s["cpu_pct"] or 0),
+                    int(s["syn_recv"] or 0),
+                    int(s["established"] or 0),
+                )
+                for s in history_snaps
+            ]
+        else:
+            item["metrics"] = None
+            item["history"] = []
+        out.append(item)
+    return out
 
 
 # ── Расшифровка для человека: известные systemd-юниты ────────────

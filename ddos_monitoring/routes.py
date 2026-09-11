@@ -46,6 +46,7 @@ def build_router(ctx):
             "poller": state,
             "nodes": await data.fleet_overview(ctx),
             "attacks_recent": await data.recent_attacks(ctx, limit=50),
+            "total_nodes_in_panel": await data.total_nodes_in_panel(ctx),
         }
         # IP атакующих в /data не попадают: отдельное право с фазы 2.
         return _json(payload)
