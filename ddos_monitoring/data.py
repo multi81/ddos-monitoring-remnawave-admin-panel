@@ -435,6 +435,129 @@ async def fleet_overview(ctx) -> list[dict[str, Any]]:
     return out
 
 
+# ── Задача #4: drill-down /history ────────────────────────────────
+
+import re as _re
+import time as _time
+from datetime import datetime as _dt, timezone as _tz
+
+_RANGE_MAP: dict[str, int] = {
+    "1h": 3600,
+    "6h": 21600,
+    "24h": 86400,
+    "7d": 604800,
+}
+
+_UUID_RE = _re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    _re.IGNORECASE,
+)
+
+
+def _parse_range_seconds(range_str: str) -> int:
+    """Парсинг range-строки (1h, 6h, 24h, 7d) → секунды.
+
+    Raises ValueError при невалидном значении.
+    """
+    val = _RANGE_MAP.get(range_str)
+    if val is None:
+        raise ValueError(
+            f"Invalid range: {range_str!r}. Allowed: {', '.join(sorted(_RANGE_MAP))}"
+        )
+    return val
+
+
+def _ts_to_iso(ts_raw: int | float | str) -> str:
+    """Конвертация ts (bigint ms или timestamptz) → ISO 8601 строка."""
+    if isinstance(ts_raw, (int, float)):
+        # ts_raw > 1e12 → milliseconds, иначе seconds
+        ts_sec = ts_raw / 1000 if ts_raw > 1e12 else ts_raw
+        return _dt.fromtimestamp(ts_sec, tz=_tz.utc).isoformat()
+    return str(ts_raw)
+
+
+def _compute_step_s(ts_list: list[str]) -> int:
+    """Вычислить реальный step_s из интервалов между срезами.
+
+    Возвращает медианный интервал в секундах, или 0 если < 2 точек.
+    """
+    if len(ts_list) < 2:
+        return 0
+    try:
+        deltas = []
+        for i in range(1, min(len(ts_list), 10)):  # до 9 интервалов
+            t1 = _dt.fromisoformat(ts_list[i - 1])
+            t2 = _dt.fromisoformat(ts_list[i])
+            deltas.append(int((t2 - t1).total_seconds()))
+        deltas.sort()
+        return deltas[len(deltas) // 2]  # медиана
+    except (ValueError, IndexError):
+        return 0
+
+
+async def history_series(
+    ctx,
+    node_uuid: str,
+    range_str: str,
+) -> dict[str, Any]:
+    """Drill-down: срезы метрик ноды за указанный range.
+
+    Возвращает:
+        {
+            "node_uuid": str,
+            "range": "1h",
+            "step_s": 60,
+            "series": {"cpu_pct": [...], "ram_pct": [...], ...},
+            "ts": ["ISO8601", ...],
+        }
+
+    Задача handoff.md #4.
+    """
+    if not _UUID_RE.match(node_uuid):
+        raise ValueError(f"Invalid node_uuid format: {node_uuid!r}")
+
+    range_seconds = _parse_range_seconds(range_str)
+    now_ms = int(_time.time() * 1000)
+    since_ms = now_ms - range_seconds * 1000
+
+    rows = await ctx.db.fetch(
+        """SELECT ts, cpu_pct, ram_pct, syn_recv, established, rx_bps
+           FROM ddos_monitoring_agent_snapshots
+           WHERE node_uuid = $1::uuid AND ts >= $2::bigint
+           ORDER BY ts ASC""",
+        node_uuid, since_ms,
+    )
+
+    ts_list: list[str] = []
+    cpu_pct: list[float] = []
+    ram_pct: list[float] = []
+    syn_recv: list[int] = []
+    established: list[int] = []
+    rx_mbps: list[float] = []
+
+    for r in rows:
+        ts_list.append(_ts_to_iso(r["ts"]))
+        cpu_pct.append(round(float(r["cpu_pct"] or 0), 1))
+        ram_pct.append(round(float(r["ram_pct"] or 0), 1))
+        syn_recv.append(int(r["syn_recv"] or 0))
+        established.append(int(r["established"] or 0))
+        rx_mbps.append(round(int(r["rx_bps"] or 0) / 1_000_000, 1))
+
+    return {
+        "node_uuid": node_uuid,
+        "range": range_str,
+        "step_s": _compute_step_s(ts_list),
+        "series": {
+            "cpu_pct": cpu_pct,
+            "ram_pct": ram_pct,
+            "syn_recv": syn_recv,
+            "established": established,
+            "rx_mbps": rx_mbps,
+        },
+        "ts": ts_list,
+    }
+
+
 # ── Расшифровка для человека: известные systemd-юниты ────────────
 UNIT_HINTS: dict[str, tuple[str, str]] = {
     "antiscan-move-rules.service": (

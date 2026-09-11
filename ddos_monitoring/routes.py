@@ -60,6 +60,15 @@ def build_router(ctx):
             out.append(d)
         return _json({"nodes": out})
 
+    @router.get("/history", summary="Drill-down: срезы метрик ноды за range (ddos:view)")
+    async def history_route(
+        node_uuid: str,
+        range: str = "1h",  # noqa: A002 — query param name matches API spec
+        _admin: AdminUser = Depends(require_permission("ddos", "view")),
+    ):
+        """GET /history?node_uuid=...&range=1h — drill-down для sparkline UI."""
+        return _json(await data.history_series(ctx, node_uuid, range))
+
     @router.get("/health", summary="Живость плагина")
     async def health(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         from .agent_installer import AGENT_VERSION
