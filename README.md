@@ -5,232 +5,274 @@
 **DDoS-мониторинг для [remnawave-admin](https://github.com/Case211/remnawave-admin)**
 
 [![Plugin API v1](https://img.shields.io/badge/Plugin%20API-v1-blue)](https://github.com/Case211/remnawave-admin)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-green.svg)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-161-brightgreen)](#тестирование)
 
-[English](#english) | [Русский](#русский)
+Реалтайм-детекция DDoS-атак на флот VPN-нод с адаптивными порогами, Telegram-алертами и встроенным дашбордом.
 
 </div>
 
 ---
 
-## Русский
-
-### Что это
-
-Плагин для remnawave-admin (Plugin API v1), который мониторит ноды на DDoS-атаки и системные проблемы. Данные поступают от **ddos-agent** (устанавливается на ноды) через WebSocket-канал панели → `node_metrics_snapshots` → плагин читает и анализирует.
-
-### Архитектура
+## Архитектура
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  remnawave-admin panel                                  │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │ ddos-monitoring plugin                          │    │
-│  │  ├─ Poller (каждые 20с)                         │    │
-│  │  │   ├─ читает node_metrics_snapshots           │    │
-│  │  │   ├─ читает ddos-agent snapshots             │    │
-│  │  │   ├─ classify() → attack/stable/load/health  │    │
-│  │  │   ├─ baseline: p95×3 за 7 дней               │    │
-│  │  │   └─ подтверждения: 2 для атаки, 3 для heal  │    │
-│  │  ├─ Routes (FastAPI)                            │    │
-│  │  │   ├─ POST /agent/report  — HMAC-приёмник     │    │
-│  │  │   ├─ GET  /data          — JSON для UI       │    │
-│  │  │   ├─ GET  /details/:uuid — подробности ноды  │    │
-│  │  │   └─ POST /agent/nodes   — установка агента  │    │
-│  │  ├─ Notify                                      │    │
-│  │  │   ├─ Telegram-бот (alerter)                  │    │
-│  │  │   └─ Panel (in-app уведомления)              │    │
-│  │  └─ Module — JS-виджет в UI панели              │    │
-│  └─────────────────────────────────────────────────┘    │
-│                                                         │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │ ddos-agent (на каждой ноде)                     │    │
-│  │  ├─ /proc/net/snmp (TCP SYN_RECV)               │    │
-│  │  ├─ /proc/net/dev (rx/tx bytes, drops)          │    │
-│  │  ├─ /proc/net/sockstat (mem, orphan, tw)        │    │
-│  │  ├─ /proc/sys/net/netfilter/nf_conntrack_*      │    │
-│  │  ├─ systemd failed-units                        │    │
-│  │  ├─ load average, CPU, RAM, disk, swap          │    │
-│  │  └─ per-protocol: TCP/UDP/ICMP bytes + pps      │    │
-│  └─────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────┘
+Нода (agent) ──WebSocket──▶ Панель (poller) ──▶ PostgreSQL
+                              │
+                              ├─ threshold check → attack start/end
+                              ├─ Telegram alert
+                              └─ UI dashboard
 ```
 
-### Ключевые возможности
+**Agent** — скрипт на каждой ноде, собирает метрики каждые 20 сек и отправляет на панель через WebSocket.
 
-| Возможность | Описание |
-|---|---|
-| **Baseline mode** | Автоматически learns нормальный трафик за 7 дней (p95×3). Пороги адаптируются к реальной нагрузке каждой ноды |
-| **Per-protocol thresholds** | TCP/UDP/ICMP — отдельные пороги по Мбит/с и pps (стиль fastnetmon) |
-| **SYN-rate detector** | Ловит медленный SYN-флуд по скорости роста `syn_recv/сек`, даже если абсолютное значение мало |
-| **TTL closure** | Висящие атаки автоматически закрываются через настраиваемый TTL (по умолчанию выкл) |
-| **State restore** | После рестарта панели — восстановление активных атак из БД (без «все зелёные») |
-| **VPN-фильтр** | Легальные VPN-клиенты не триггерят атаку (опционально) |
-| **Agent install** | Автоматическая установка ddos-agent на ноды через `exec_script` панели |
-| **Precheck** | Проверка готовности ноды (agent_token, WebSocket) перед установкой агента |
+**Poller** — ядро панели. Получает снапшоты, сравнивает с порогами, открывает/закрывает атаки, шлёт алерты.
 
-### Детект атак
-
-**Источник 1: панель** (`node_metrics_snapshots`)
-
-| Порог | Значение по умолчанию | Описание |
-|---|---|---|
-| `rx_bps` | 200 Мбит/с | Входящий трафик |
-| `rx_pps` | 30k pps | Пакеты в секунду |
-| `syncookies_ps` | 200/с | SYN cookies |
-| `listen_drop_ps` | 100/с | Listen drops |
-| `conntrack_ratio` | 75% | Заполненность conntrack |
-| `cpu_percent` | 90% | CPU |
-| `memory_percent` | 90% | RAM |
-| `load_per_cpu` | 2.0 | Load average |
-| `disk_percent` | 85% | Диск |
-
-**Источник 2: ddos-agent** (полные метрики)
-
-| Порог | Значение | Описание |
-|---|---|---|
-| `tcp_mbps` / `udp_mbps` / `icmp_mbps` | 100 Мбит/с | Per-protocol bandwidth |
-| `tcp_pps` / `udp_pps` / `icmp_pps` | 100k pps | Per-protocol pps |
-| `syn_recv` | 1000 | SYN_RECV в очереди |
-| `syn_rate` | 50/сек | Рост SYN_RECV (медленный флуд) |
-
-**Типы атак:** TCP SYN-флуд, conntrack-исчерпание, TCP-флуд (переполнение очереди), пакетный флуд, объёмный флуд, per-protocol (UDP/ICMP flood)
-
-**Severity:** `critical` (3× порога или conntrack ≥95%) → `high` (1.5×) → `medium`
-
-**Lifecycle:** подтверждение 2 тика для атаки, 3 тика для recovery. Cooldown 5 мин между алертами.
-
-### Baseline mode
-
-Вместо статических порогов — автоматическая калибровка по реальному трафику:
-
-1. Каждый час poller пересчитывает **p95** за последние 7 дней
-2. Порог = `p95 × expression` (по умолчанию `value * 3`)
-3. Минимальные пороги защищают от слишком низких baseline на тихих нодах
-4. Включается через `plugin_settings.baseline_enabled = true`
-
-```
-Порог = max(p95_за_7_дней × 3, минимальный_порог)
-```
-
-### Установка
-
-```bash
-# 1. Клонировать в директорию плагинов панели
-git clone https://github.com/multi81/ddos-monitoring-remnawave-admin-panel.git \
-  /path/to/remnawave-admin/plugins/ddos-monitoring
-
-# 2. Установить зависимости
-cd /path/to/remnawave-admin/plugins/ddos-monitoring
-pip install -e .
-
-# 3. Перезапустить панель — плагин зарегистрируется автоматически
-```
-
-### Настройка
-
-**plugin_settings** (создаются автоматически при первом запуске):
-
-| Ключ | Значение по умолчанию | Описание |
-|---|---|---|
-| `thresholds` | `{}` | Кастомные пороги (перекрывают defaults) |
-| `baseline_enabled` | `false` | Включить baseline mode |
-| `exclude_vpn` | `false` | Исключить VPN-клиенты из детекта |
-| `alert_cooldown_s` | `300` | Cooldown между алертами (сек) |
-| `attack_stale_ttl_s` | `0` | TTL для зависших атак (0 = выкл) |
-
-### ddos-agent
-
-Устанавливается на ноды через панель (POST `/agent/nodes`). Сбор метрик:
-
-- `/proc/net/snmp` — TCP SYN_RECV, established, time-wait
-- `/proc/net/dev` — rx/tx bytes, packets, drops
-- `/proc/net/sockstat` — mem, orphan, timewait
-- `/proc/sys/net/netfilter/` — conntrack count/max
-- `systemctl list-units --failed` — упавшие юниты
-- `/proc/loadavg`, `/proc/stat`, `/proc/meminfo` — CPU, RAM, load, swap
-- Per-protocol: TCP/UDP/ICMP bytes + pps (из `/proc/net/snmp` + XDP)
-
-### Авторизация
-
-| Метод | Описание |
-|---|---|
-| **HMAC-SHA256** | Агент → панель. Секрет хранится в `plugin_settings` (auto-init). Replay-защита: ±120с по timestamp |
-| **RBAC** | Два права: `ddos:view` (атаки и нагрузка), `ddos:view_ips` (IP атакующих) |
-| **Agent precheck** | Перед установкой агента: проверка `agent_token` и WebSocket-соединения |
-
-### API Endpoints
-
-| Метод | Путь | Описание | Авторизация |
-|---|---|---|---|
-| `POST` | `/agent/report` | Приём среза от агента | HMAC |
-| `GET` | `/data` | Состояние флота + активные атаки | `ddos:view` |
-| `GET` | `/details/:uuid` | Детали по ноде (метрики, атаки, топ IP) | `ddos:view` |
-| `GET` | `/summary` | Текстовое саммари (для TG-бота) | `ddos:view` |
-| `POST` | `/settings` | Обновить настройки плагина | admin |
-| `POST` | `/baseline/recompute` | Принудительный пересчёт baseline | admin |
-| `POST` | `/agent/nodes` | Установить агента на ноды | admin |
-| `GET` | `/agent/status` | Статус агентов (версия, свежесть) | `ddos:view` |
-| `GET` | `/settings` | Текущие настройки | `ddos:view` |
-| `GET` | `/events` | Последние события | `ddos:view` |
-
-### Зависимости
-
-```
-fastapi
-asyncpg
-```
-
-### Тесты
-
-```bash
-pip install -e ".[test]"
-pytest tests/ -v
-```
-
-161 тестов покрывают: classify, baseline, poller lifecycle, agent receiver, routes RBAC, notify, schema, agent install precheck, SYN-rate, offline attack close, per-protocol thresholds, state restore, name fallback race, CPU% baseline.
-
-### Статус
-
-**v0.7.48** — production-ready. Активно используется.
+**Dashboard** — веб-интерфейс с KPI, гистограммами, sparkline и таблицей атак.
 
 ---
 
-## English
+## Метрики
 
-### What
+Агент отправляет снапшот каждые 20 сек:
 
-A plugin for [remnawave-admin](https://github.com/Case211/remnawave-admin) (Plugin API v1) that monitors nodes for DDoS attacks and system health issues. Data comes from **ddos-agent** installed on each node via the panel's WebSocket channel.
+| Категория | Метрики |
+|-----------|---------|
+| **Трафик** | `rx_bps`, `tx_bps` — байт/сек входящий/исходящий |
+| **Пакеты** | `rx_pps` — пакетов/сек |
+| **Соединения** | `syn_recv`, `established` — TCP-состояния |
+| **Дропы** | `syncookies_ps`, `listen_drop_ps`, `rx_drop_ps` — счётчики |
+| **Conntrack** | `conntrack_count`, `conntrack_max` — таблица соединений |
+| **Ресурсы** | `cpu_pct`, `ram_pct`, `swap_pct`, `disk_pct`, `load1`, `cores` |
 
-### Key Features
+Панель сохраняет снапшоты в `ddos_monitoring_agent_snapshots` (один INSERT на ноду за тик).
 
-- **Baseline mode** — auto-calibrates thresholds from 7-day p95 traffic patterns
-- **Per-protocol thresholds** — TCP/UDP/ICMP separate thresholds (fastnetmon-style)
-- **SYN-rate detector** — catches slow SYN floods by growth rate
-- **TTL closure** — auto-close stale attacks after configurable TTL
-- **State restore** — survives panel restarts without losing active attacks
-- **VPN filtering** — legal VPN clients excluded from attack detection
-- **Agent auto-install** — deploy ddos-agent to nodes via panel's `exec_script`
-- **Precheck** — verifies node readiness (agent_token, WebSocket) before install
+---
 
-### Quick Start
+## Пороги
 
-```bash
-git clone https://github.com/multi81/ddos-monitoring-remnawave-admin-panel.git \
-  /path/to/remnawave-admin/plugins/ddos-monitoring
-cd /path/to/remnawave-admin/plugins/ddos-monitoring
-pip install -e .
-# Restart panel — plugin registers automatically
+### Статические (по умолчанию)
+
+| Метрика | Порог | Описание |
+|---------|-------|----------|
+| `rx_bps` | 200 Мбит/с | Объёмный входящий трафик |
+| `rx_pps` | 30,000 | Пакетов в секунду |
+| `syncookies_ps` | 200 | SYN-cookie активация (SYN-flood) |
+| `listen_drop_ps` | 100 | TCP listen queue overflow |
+| `rx_drop_ps` | 50 | NIC дропы |
+| `cpu_percent` | 90% | Загрузка CPU |
+| `memory_percent` | 90% | Загрузка RAM |
+| `load_per_cpu` | 2.0 | Средняя нагрузка на ядро |
+| `disk_percent` | 85% | Загрузка диска |
+| `conntrack_ratio` | 75% | Заполненность conntrack |
+
+### Baseline (адаптивные)
+
+Включаются через `baseline_mode=true`. Каждый час poller пересчитывает пороги на основе 7-дневной истории:
+
+| Метрика | Формула | Min floor |
+|---------|---------|-----------|
+| `rx_bps` | p95 × 3 | ≥ 20 Мбит/с |
+| `rx_pps` | p95 × 2 | ≥ 5,000 |
+| `syncookies_ps` | p95 + 5 | ≥ 10 |
+| `listen_drop_ps` | p95 + 5 | ≥ 5 |
+| `rx_drop_ps` | p95 + 5 | ≥ 5 |
+
+**Итоговый порог** = `max(static, baseline, min_floor)` — берётся наибольший.
+
+Каждая нода адаптируется к **своему** трафику.
+
+### Per-node
+
+Индивидуальные пороги на конкретную ноду через `plugin_settings`.
+
+---
+
+## Детекция
+
+Каждый тик (20 сек) для каждой ноды:
+
+1. **Собрать** текущие метрики от agent'а
+2. **Вычислить** effective thresholds (static + baseline)
+3. **Проверить** каждую метрику против порога:
+   - `syncookies_ps > threshold` → **SYN-flood**
+   - `rx_bps > threshold` → **объёмная атака**
+   - `rx_pps > threshold` → **packet flood**
+   - `listen_drop_ps > threshold` → **TCP overflow**
+   - `rx_drop_ps > threshold` → **NIC drops**
+   - `cpu/ram/disk/load/conntrack` → **ресурсные**
+4. Если **хотя бы одна** метрика превышена → **ATTACK**
+
+---
+
+## Lifecycle атаки
+
+```
+METRIC > THRESHOLD
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ Нет активной атаки для этой ноды?              │
+│   → INSERT в ddos_monitoring_attacks           │
+│   → started_at = NOW()                         │
+│   → severity = CRITICAL / WARNING / LOW        │
+│   → Telegram: "🔴 АТАКА НА ..."                │
+└─────────────────────────────────────────────────┘
+    │
+    ▼  (каждый тик: метрика всё ещё выше порога)
+┌─────────────────────────────────────────────────┐
+│ Атака активна                                   │
+│   → Обновить last_seen_at                       │
+│   → Обновить severity (максимальная метрика)    │
+│   → Обновить attack_type                        │
+└─────────────────────────────────────────────────┘
+    │
+    ▼  (метрика упала ниже порога)
+┌─────────────────────────────────────────────────┐
+│   → ended_at = NOW()                            │
+│   → Telegram: "🟢 АТАКА ЗАВЕРШЕНА (длительность)"│
+└─────────────────────────────────────────────────┘
 ```
 
-### Tests
+### Stale attack cleanup
 
-```bash
-pip install -e ".[test]"
-pytest tests/ -v  # 161 tests
+Если нода не отвечает > `attack_stale_ttl_s` (по умолчанию 0 = выкл):
+
+- Все активные атаки этой ноды закрываются (`ended_at = NOW()`)
+- Telegram: *"⚪ Атака закрыта — нода не отвечает"*
+
+---
+
+## Severity
+
+| Уровень | Критерий |
+|---------|----------|
+| 🔴 **CRITICAL** | `syncookies > 2× порога` ИЛИ `rx_bps > 5× порога` |
+| 🟡 **WARNING** | Метрика > порога, но не critical |
+| 🔵 **LOW** | Незначительное превышение |
+
+---
+
+## Telegram-алерты
+
+**Начало атаки:**
+```
+🔴 АТАКА НА <node_name>
+Тип: SYN-flood / Volume / TCP-overflow
+Severity: CRITICAL
+Метрики: syncookies=1500 (порог=200), rx_bps=850M (порог=200M)
+Время: 2026-09-11 16:30:00 UTC
 ```
 
-### Status
+**Конец атаки:**
+```
+🟢 АТАКА ЗАВЕРШЕНА: <node_name>
+Длительность: 5m 32s
+Пик: syncookies=1500, rx_bps=850M
+```
 
-**v0.7.48** — production-ready. Actively maintained.
+**Нода не отвечает:**
+```
+⚪ Атака закрыта — нода не отвечает: <node_name>
+```
+
+---
+
+## UI Dashboard
+
+- **KPI**: всего нод, online, атаки, severity
+- **Гистограмма**: атаки за 24ч по часам
+- **Карточки нод**: CPU/RAM bars, sparkline 8ч, severity pill, сортировка ▲▼
+- **Таблица атак**: нода, начало, конец, тип, severity, длительность
+- **Секции**: TG-бот статус, Agent статус
+
+---
+
+## API
+
+| Endpoint | Описание |
+|----------|----------|
+| `GET /data` | Fleet overview — все ноды + KPI + attacks |
+| `GET /details` | Детали конкретной ноды |
+| `GET /history?node_uuid=...&range=1h` | Drill-down sparkline |
+| `POST /nodes/order` | Сортировка нод |
+| `GET /tg` | Telegram-бот статус |
+| `GET /agent` | Agent статус |
+| `GET /health` | Liveness check |
+
+---
+
+## Настройки
+
+| Параметр | Default | Описание |
+|----------|---------|----------|
+| `baseline_mode` | `false` | Адаптивные пороги (p95 за 7 дней) |
+| `baseline_p95` | `0.95` | Перцентиль для baseline |
+| `baseline_window_days` | `7` | Окно истории baseline |
+| `attack_stale_ttl_s` | `0` | Авто-закрытие атак при offline ноды (0 = выкл) |
+| Per-node thresholds | — | Индивидуальные пороги на ноду |
+
+---
+
+## Быстрый старт
+
+### 1. Установка плагина
+
+```bash
+cd /path/to/remnawave-admin
+npm run plugins:install -- https://github.com/multi81/ddos-monitoring-remnawave-admin-panel
+npm run plugins:build
+systemctl restart remnawave-admin
+```
+
+### 2. Установка агента на ноды
+
+Панель → DDoS Monitoring → **Install agent** — автоматический деплой через SSH.
+
+Или вручную:
+```bash
+curl -fsSL https://raw.githubusercontent.com/multi81/ddos-monitoring-remnawave-admin-panel/main/ddos_monitoring/agent/install.sh | bash -s -- \
+  --url wss://your-panel.example.com \
+  --token <node-agent-token>
+```
+
+### 3. Настройка
+
+1. Откройте панель → DDoS Monitoring
+2. Нажмите **Settings** → включите нужные пороги
+3. Рекомендуется включить `baseline_mode` для адаптивных порогов
+
+---
+
+## Тестирование
+
+```bash
+# Все тесты
+python -m pytest tests/ -v
+
+# Только unit
+python -m pytest tests/test_poller_*.py tests/test_module.py -v
+
+# Без network/SSH
+python -m pytest tests/ -v -k "not remote"
+```
+
+**161 тестов** — poller, thresholds, baseline, attacks, agent install, module, notify, schema, race conditions.
+
+---
+
+## Стек
+
+- **Backend**: Python 3.11+, aiohttp, aiosqlite, paramiko
+- **Agent**: Python 3.11+, psutil, websockets
+- **Storage**: SQLite (WAL mode, migrations)
+- **UI**: aiohttp + Vanilla JS (lit-html)
+- **Alerts**: Telegram Bot API
+
+---
+
+<div align="center">
+
+**[Plugin API](https://github.com/Case211/remnawave-admin)** · **[Issues](https://github.com/multi81/ddos-monitoring-remnawave-admin-panel/issues)**
+
+</div>
