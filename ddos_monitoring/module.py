@@ -670,12 +670,8 @@ MODULE_JS = r"""
         var newOrder = Array.from(parent.querySelectorAll('.ddos-node')).map(function (el, i) {
           return { node_uuid: el.getAttribute('data-uuid'), sort_order: i };
         });
-        fetch(API_BASE + '/nodes/order', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-          body: JSON.stringify({ order: newOrder }),
-        }).catch(function (err) { console.warn('[ddos] sort save failed', err); });
+        _fetchJSON('/nodes/order', 'POST', { order: newOrder })
+          .catch(function (err) { console.warn('[ddos] sort save failed', err); });
       });
     }
   }
