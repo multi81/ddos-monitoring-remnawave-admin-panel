@@ -616,7 +616,8 @@ class DdosPoller:
             if uuid not in seen:
                 entry = self._nodes[uuid]
                 await self._handle_offline(ctx, log, uuid, entry.get("name") or node_names.get(uuid, ""), now)
-                entry["verdict"] = entry.get("verdict", "nodata")
+                # entry["verdict"] уже обновлён в _handle_offline (offline или сохранён).
+                # Здесь ничего не пишем — иначе перезатрём только что установленный verdict.
                 await data.record_sample(ctx, uuid, node_names.get(uuid, ""), None,
                                          "no telemetry" if entry["verdict"] != "offline" else None)
 

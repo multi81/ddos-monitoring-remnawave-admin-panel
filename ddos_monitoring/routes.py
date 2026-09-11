@@ -17,6 +17,7 @@ def _json(payload: dict, status: int = 200) -> JSONResponse:
 
 def build_router(ctx):
     from fastapi import APIRouter, Depends, HTTPException, Body
+    from starlette.requests import Request
 
     from web.backend.core.plugin_api import auth_deps
 
@@ -28,14 +29,21 @@ def build_router(ctx):
 
     @router.post("/agent/report", summary="Срез ddos-agent: HMAC, без админ-сессии",
                  include_in_schema=False)
-    async def agent_report(request=None, payload: dict = None):
-        """Публичный endpoint для агентов. Авторизация — только HMAC-подпись."""
+    async def agent_report(request: Request, payload: dict | None = Body(default=None)):
+        """Публичный endpoint для агентов. Авторизация — только HMAC-подпись.
+
+        FastAPI: request имеет явный тип Request (иначе DI не подставит).
+        payload — из тела запроса через Body(...). Если None — пытаемся распарсить
+        JSON вручную как fallback.
+        """
         from .agent_receiver import AgentReceiver
         if payload is None:
             try:
                 payload = await request.json()
             except Exception:
                 return _json({"saved": False, "error": "bad_payload"}, status=400)
+        if not isinstance(payload, dict):
+            return _json({"saved": False, "error": "bad_payload"}, status=400)
         res = await AgentReceiver(ctx).handle(payload)
         return _json(res, status=200 if res.get("saved") else 400)
 

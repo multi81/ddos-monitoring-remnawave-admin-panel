@@ -229,13 +229,20 @@ def main():
     while True:
         try:
             m = collect()
-            # CPU% считается по дельте /proc/stat между циклами
+            # CPU% считается по дельте /proc/stat между циклами.
+            # Сохраняем текущий baseline ДО чтения prev (фикс: раньше prev_idle
+            # использовался как undefined name → NameError → silent pass).
+            cur_cpu_total = m.get("_cpu_total")
+            cur_cpu_idle = m.get("_cpu_idle", 0)
             prev = _net_prev.get("cpu")
-            if prev and m.get("_cpu_total"):
-                dt = m["_cpu_total"] - prev
-                didle = m.get("_cpu_idle", 0) - prev_idle
+            if prev is not None and cur_cpu_total:
+                dt = cur_cpu_total - prev[0]
+                didle = cur_cpu_idle - prev[1]
                 if dt > 0:
                     m["cpu_pct"] = round(100.0 * (dt - didle) / dt, 1)
+            # Обновляем baseline для следующего цикла.
+            if cur_cpu_total:
+                _net_prev["cpu"] = (cur_cpu_total, cur_cpu_idle)
             report({k: v for k, v in m.items() if not k.startswith("_")})
         except Exception:
             pass

@@ -83,9 +83,9 @@ async def get_vpn_ip_map(ctx, window_s: int = VPN_WINDOW_S) -> dict:
             FROM user_connections uc
             WHERE uc.ip_address IS NOT NULL AND uc.ip_address <> ''
               AND (uc.disconnected_at IS NULL
-                   OR uc.disconnected_at > now() - ($1 || ' seconds')::interval)
+                   OR uc.disconnected_at > now() - make_interval(secs => $1))
             """,
-            str(int(window_s)),
+            int(window_s),
         )
     except Exception:
         return {}
@@ -111,12 +111,12 @@ async def top_sources(ctx, limit: int = 50,
             FROM ddos_monitoring_events ev,
                  jsonb_array_elements(ev.payload->'top_ips') e
             WHERE ev.kind = 'attack_start'
-              AND ev.created_at > now() - ($1 || ' seconds')::interval
+              AND ev.created_at > now() - make_interval(secs => $1)
             GROUP BY e->>'ip'
             ORDER BY cnt DESC
             LIMIT $2
             """,
-            str(int(window_s)), int(limit),
+            int(window_s), int(limit),
         )
     except Exception:
         return []
