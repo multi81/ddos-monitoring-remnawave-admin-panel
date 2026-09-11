@@ -175,23 +175,26 @@ async def ensure_schema(ctx) -> None:
     # если значение уже есть; админ может поменять через UI/SQL позже).
     # baseline_mode выключен по умолчанию (opt-in), чтобы не ломать поведение
     # при апгрейде с v0.7.46.
-    await _ensure_plugin_setting(ctx, "baseline_mode", "false", "boolean")
-    await _ensure_plugin_setting(ctx, "baseline_window_days", "7", "number")
-    await _ensure_plugin_setting(ctx, "baseline_p95", "0.95", "number")
+    await _ensure_plugin_setting(ctx, "baseline_mode", "false")
+    await _ensure_plugin_setting(ctx, "baseline_window_days", "7")
+    await _ensure_plugin_setting(ctx, "baseline_p95", "0.95")
 
 
-async def _ensure_plugin_setting(ctx, key: str, default_value: str, value_type: str) -> None:
+async def _ensure_plugin_setting(ctx, key: str, default_value: str) -> None:
     """Upsert настройки плагина с дефолтом. Не перезаписывает существующие.
 
     Используется при ensure_schema: первый запуск после установки wheel
     создаёт записи, последующие — no-op.
+
+    value хранится как jsonb (true/false/7/0.95); value_type НЕ записывается —
+    panel-provided таблица plugin_settings не имеет такой колонки.
     """
     await ctx.db.execute(
         """INSERT INTO plugin_settings
-               (plugin_id, key, value, value_type, updated_at)
-           VALUES ($1, $2, $3::jsonb, $4, NOW())
+               (plugin_id, key, value, updated_at)
+           VALUES ($1, $2, $3::jsonb, NOW())
            ON CONFLICT (plugin_id, key) DO NOTHING""",
-        ctx.plugin_id, key, default_value, value_type,
+        ctx.plugin_id, key, default_value,
     )
 
 
