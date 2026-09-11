@@ -941,9 +941,18 @@ class DdosPoller:
         except Exception:  # noqa: BLE001 — восстановление не должно ломать тик
             pass
 
-    def _summary_rows(self) -> list[tuple]:
+    async def _summary_rows(self, ctx) -> list[tuple]:
+        # Загружаем sort_order из БД для сортировки в TG-саммари
+        sort_map: dict[str, int] = {}
+        try:
+            for r in await ctx.db.fetch(
+                    "SELECT node_uuid::text, sort_order FROM ddos_monitoring_node_state"):
+                sort_map[str(r["node_uuid"])] = r["sort_order"]
+        except Exception:  # noqa: BLE001
+            pass
         rows = []
-        for uuid, e in sorted(self._nodes.items(), key=lambda kv: kv[1].get("name") or ""):
+        for uuid, e in sorted(self._nodes.items(),
+                              key=lambda kv: (sort_map.get(kv[0], 0), kv[1].get("name") or "")):
             state = e.get("verdict", "unknown")
             # Кандидат в атаку ещё на подтверждении — в саммари честно показываем
             # атаку (лучше лишний раз предупредить, чем отчитаться «стабильно»
@@ -994,7 +1003,7 @@ class DdosPoller:
             if uuid in self._nodes:
                 self._nodes[uuid]["name"] = name
         try:
-            await notify.send_summary(ctx, self._summary_rows())
+            await notify.send_summary(ctx, await self._summary_rows(ctx))
         except Exception:  # noqa: BLE001 — summary не роняет тик
             log.warning("ddos-monitoring: summary send failed", exc_info=True)
             return
