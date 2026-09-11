@@ -2,94 +2,155 @@
 
 # 🛡️ ddos-monitoring
 
-**DDoS-мониторинг для [remnawave-admin](https://github.com/Case211/remnawave-admin)**
+**Реалтайм-детекция DDoS для VPN-инфраструктуры**
 
-[![Plugin API v1](https://img.shields.io/badge/Plugin%20API-v1-blue)](https://github.com/Case211/remnawave-admin)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-green.svg)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-161-brightgreen)](#тестирование)
+[![Plugin API v1](https://img.shields.io/badge/Plugin_API-v1-blue?style=for-the-badge)](https://github.com/Case211/remnawave-admin)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/Tests-175-00C853?style=for-the-badge)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
 
-Реалтайм-детекция DDoS на флот VPN-нод. Адаптивные пороги, Telegram-алерты, встроенный дашборд.
+Адаптивные пороги · Telegram-алерты · Встроенный дашборд · Автодеплой агентов
 
 </div>
 
 ---
 
-## Архитектура
+## Как работает
 
 ```
-Нода (agent) ──WebSocket──▶ Панель (poller) ──▶ SQLite
-                              │
-                              ├─ threshold check → attack start/end
-                              ├─ Telegram alert
-                              └─ UI dashboard
+┌──────────┐    WebSocket     ┌──────────┐     SQLite     ┌──────────┐
+│  Агент   │ ───────────────▶ │  Панель  │ ◀──────────── │ Dashboard│
+│ (нода)   │  каждые 20 сек   │ (poller) │                │   (UI)   │
+└──────────┘                  └────┬─────┘                └──────────┘
+                                   │
+                          ┌────────┼────────┐
+                          ▼        ▼        ▼
+                     Пороги   Атака    Telegram
 ```
 
-**Agent** — на каждой ноде, шлёт метрики каждые 20 сек. **Poller** — ядро, сравнивает с порогами, управляет атаками. **Dashboard** — веб-UI с KPI и sparkline.
+Агент на каждой ноде собирает метрики → панель сравнивает с порогами → при превышении открывает атаку и шлёт алерт.
 
 ---
 
 ## Метрики
 
-| Категория | Что собирает |
-|-----------|-------------|
-| Трафик | `rx_bps`, `tx_bps` — байт/сек |
-| Пакеты | `rx_pps` — пакетов/сек |
-| TCP | `syn_recv`, `established` — соединения |
-| Дропы | `syncookies_ps`, `listen_drop_ps`, `rx_drop_ps` |
-| Conntrack | `conntrack_count`, `conntrack_max` |
-| Ресурсы | `cpu_pct`, `ram_pct`, `swap_pct`, `disk_pct`, `load1` |
+| Что | Метрики | Зачем |
+|-----|---------|-------|
+| 🌐 Трафик | `rx_bps` · `tx_bps` · `rx_pps` | Объём и пакеты |
+| 🔌 TCP | `syn_recv` · `established` · `syncookies_ps` | SYN-flood |
+| 💧 Дропы | `listen_drop_ps` · `rx_drop_ps` | Overflow / NIC |
+| 📊 Conntrack | `conntrack_count` · `conntrack_max` | Таблица соединений |
+| ⚙️ Ресурсы | `cpu_pct` · `ram_pct` · `disk_pct` · `load1` | Загрузка ноды |
 
 ---
 
 ## Пороги
 
-**Статические** (по умолчанию): `rx_bps` 200M, `rx_pps` 30K, `syncookies` 200, `listen_drop` 100, `rx_drop` 50, CPU/RAM 90%, disk 85%, conntrack 75%, load/cpu 2.0.
+### Статические
 
-**Baseline** (`baseline_mode=true`): каждый час — p95 за 7 дней × коэффициент. Нода адаптируется к своему трафику. Min floor: rx_bps ≥ 20M, rx_pps ≥ 5K.
+| Метрика | Порог | | Метрика | Порог |
+|---------|-------|-|---------|-------|
+| `rx_bps` | 200 Мбит/с | | `cpu` | 90% |
+| `rx_pps` | 30K | | `ram` | 90% |
+| `syncookies` | 200/с | | `disk` | 85% |
+| `listen_drop` | 100/с | | `load/cpu` | 2.0 |
+| `rx_drop` | 50/с | | `conntrack` | 75% |
 
-**Per-node**: индивидуальные пороги через настройки плагина.
+### Baseline (адаптивные)
 
-Итоговый порог = `max(static, baseline, min_floor)`.
+Включается через `baseline_mode=true`. Каждый час пересчёт p95 за 7 дней:
+
+| Метрика | Формула | Минимум |
+|---------|---------|---------|
+| `rx_bps` | p95 × 3 | ≥ 20 Мбит/с |
+| `rx_pps` | p95 × 2 | ≥ 5 000 |
+| `syncookies` | p95 + 5 | ≥ 10 |
+| `drops` | p95 + 5 | ≥ 5 |
+
+**Итого**: `max(static, baseline, min)` — каждая нода адаптируется к себе.
 
 ---
 
 ## Lifecycle атаки
 
 ```
-METRIC > THRESHOLD
-  → Нет активной атаки? INSERT, severity, Telegram "🔴 АТАКА"
-  → Атака есть? Обновить last_seen, severity, type
-METRIC < THRESHOLD
-  → ended_at, Telegram "🟢 ЗАВЕРШЕНА (длительность)"
-Nода не отвечает > stale_ttl
-  → Все атаки закрыты, Telegram "⚪ Нода не отвечает"
+  МЕТРИКА > ПОРОГ
+        │
+        ▼
+  ┌─ Нет активной атаки? ──────────────────────────┐
+  │  • Запись в attacks (started_at, severity)      │
+  │  • Telegram: 🔴 АТАКА НА <нода>                 │
+  └─────────────────────────────────────────────────┘
+        │
+        ▼  (метрика всё ещё выше)
+  ┌─ Атака активна ─────────────────────────────────┐
+  │  • Обновление last_seen, severity, attack_type   │
+  └─────────────────────────────────────────────────┘
+        │
+        ▼  (метрика ниже порога)
+  ┌─ Завершение ────────────────────────────────────┐
+  │  • ended_at = NOW()                              │
+  │  • Telegram: 🟢 ЗАВЕРШЕНА (длительность)         │
+  └─────────────────────────────────────────────────┘
 ```
 
-**Severity**: 🔴 CRITICAL (syncookies > 2× или rx_bps > 5×), 🟡 WARNING (> порога), 🔵 LOW.
+---
+
+## Severity
+
+| Уровень | Когда |
+|---------|-------|
+| 🔴 **CRITICAL** | `syncookies > 2× порога` или `rx_bps > 5× порога` |
+| 🟡 **WARNING** | Превышение порога (не critical) |
+| 🔵 **LOW** | Незначительное превышение |
 
 ---
 
 ## Telegram-алерты
 
-```
-🔴 АТАКА НА <node>
-Тип: SYN-flood | Severity: CRITICAL
-Метрики: syncookies=1500 (порог=200)
+| Событие | Формат |
+|---------|--------|
+| Начало | `🔴 АТАКА НА <нода>` — тип, severity, метрики, время |
+| Конец | `🟢 ЗАВЕРШЕНА: <нода>` — длительность, пик |
+| Нода молчит | `⚪ Атака закрыта — нода не отвечает` |
 
-🟢 ЗАВЕРШЕНА: <node> | Длительность: 5m 32s
-```
+---
+
+## Dashboard
+
+| Элемент | Что показывает |
+|---------|---------------|
+| **KPI-карточки** | Всего нод · Online · Атаки · Max severity |
+| **Гистограмма** | Атаки за 24ч по часам |
+| **Карточки нод** | CPU/RAM bars · sparkline 8ч · severity pill · сортировка ▲▼ |
+| **Таблица атак** | Нода · начало · конец · тип · severity · длительность |
+| **Статус** | TG-бот · Agent |
 
 ---
 
 ## API
 
-| Endpoint | Описание |
-|----------|----------|
-| `GET /data` | Fleet overview — ноды + KPI + attacks |
-| `GET /details` | Детали ноды |
-| `GET /history?node_uuid=...&range=1h` | Sparkline |
-| `POST /nodes/order` | Сортировка |
-| `GET /health` | Liveness |
+```
+GET  /data                      ← Fleet overview (ноды + KPI + attacks)
+GET  /details                   ← Детали ноды
+GET  /history?node_uuid=...&range=1h  ← Sparkline
+POST /nodes/order               ← Сортировка
+GET  /tg                        ← Telegram-бот статус
+GET  /agent                     ← Agent статус
+GET  /health                    ← Liveness
+```
+
+---
+
+## Настройки
+
+| Параметр | По умолчанию | Описание |
+|----------|:---:|---------|
+| `baseline_mode` | `off` | Адаптивные пороги (p95 × коэффициент) |
+| `baseline_p95` | `0.95` | Перцентиль |
+| `baseline_window_days` | `7` | Окно истории |
+| `attack_stale_ttl_s` | `0` | Авто-закрытие при offline (0 = выкл) |
+| Per-node thresholds | — | Пороги на конкретную ноду |
 
 ---
 
@@ -100,22 +161,40 @@ Nода не отвечает > stale_ttl
 cd /path/to/remnawave-admin
 npm run plugins:install -- https://github.com/multi81/ddos-monitoring-remnawave-admin-panel
 npm run plugins:build && systemctl restart remnawave-admin
+```
 
-# Агент на ноду (через UI или вручную)
-curl -fsSL https://raw.githubusercontent.com/.../install.sh | bash -s -- --url wss://panel --token <token>
+**Агент на ноды** — через UI (кнопка *Install agent*) или вручную:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/multi81/ddos-monitoring-remnawave-admin-panel/main/ddos_monitoring/agent/install.sh | \
+  bash -s -- --url wss://your-panel.example.com --token <node-token>
 ```
 
 ---
 
-## Тестирование
+## Тесты
 
 ```bash
-python -m pytest tests/ -v          # 161 тестов
-python -m pytest tests/ -v -k "not remote"  # без SSH
+python -m pytest tests/ -v              # Все 175 тестов
+python -m pytest tests/ -v -k "not remote"  # Без SSH
 ```
 
 ---
 
 ## Стек
 
-Python 3.11+ · aiohttp · aiosqlite · psutil · websockets · Telegram Bot API · Vanilla JS (lit-html)
+| Слой | Технологии |
+|------|-----------|
+| Backend | Python 3.11+ · aiohttp · aiosqlite · paramiko |
+| Agent | psutil · websockets |
+| Storage | SQLite (WAL, миграции) |
+| UI | Vanilla JS · lit-html |
+| Alerts | Telegram Bot API |
+
+---
+
+<div align="center">
+
+[Issues](https://github.com/multi81/ddos-monitoring-remnawave-admin-panel/issues) · [Remnawave Admin](https://github.com/Case211/remnawave-admin)
+
+</div>
