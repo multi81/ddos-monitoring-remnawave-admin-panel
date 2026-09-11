@@ -394,7 +394,6 @@ async def node_details(ctx) -> list[dict[str, Any]]:
                 "total_ips": len(br or []),
             })
         cpus = max(int(s["cores"] or 1), 1)
-        load_ratio = (float(s["load1"] or 0) / cpus / DEFAULT_THRESHOLDS["load_per_cpu"]) if DEFAULT_THRESHOLDS["load_per_cpu"] else 0
         metrics = {
             "syn_recv": int(s["syn_recv"] or 0),
             "established": int(s["established"] or 0),

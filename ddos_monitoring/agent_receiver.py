@@ -2,6 +2,7 @@
 
 Панель не трогаем — endpoint регистрируется роутером плагина.
 """
+from __future__ import annotations
 
 import hashlib
 import hmac
@@ -17,12 +18,18 @@ ONLINE_WINDOW_S = 90
 _last_report: dict = {}
 # Replay-защита: последние виденные ts per node (окно STALE_WINDOW_S).
 # Лимит uuid защищает от распухания карты при спуфинге node_uuid.
+# set-значение ограничено: вытесняем ts, которые (a) устарели (old than cutoff)
+# или (b) слишком в будущем (future drift ≥ STALE_WINDOW_S — защита от OOM-атаки).
 _seen_ts: dict = {}
 _SEEN_MAX_UUIDS = 4096
+# Лимит размера set'a per uuid (защита от долгоживущих future ts)
+_SEEN_MAX_TS_PER_UUID = 256
 
 
 def _check_replay(uuid: str, ts: int) -> bool:
-    """True = дубликат. Держим только свежие метки."""
+    """True = дубликат. Защита от будущих ts (OOM-вектор):
+    ts дальше чем now + STALE_WINDOW_S считаем уже валидным, не храним.
+    """
     now = time.time()
     seen = _seen_ts.get(uuid)
     if seen is None:
@@ -32,19 +39,23 @@ def _check_replay(uuid: str, ts: int) -> bool:
             _seen_ts.pop(oldest, None)
         _seen_ts[uuid] = set()
         seen = _seen_ts[uuid]
-    # чистка устаревших
-    cutoff = now - STALE_WINDOW_S
-    _seen_ts[uuid] = {t for t in seen if t > cutoff}
-    if ts in _seen_ts[uuid]:
+    # чистка устаревших + future-drift
+    cutoff_old = now - STALE_WINDOW_S
+    cutoff_future = now + STALE_WINDOW_S
+    _seen_ts[uuid] = {t for t in seen if cutoff_old <= t <= cutoff_future}
+    # Лимит размера set'а per uuid (на случай ОЧЕНЬ долгой жизни ключа)
+    if len(_seen_ts[uuid]) >= _SEEN_MAX_TS_PER_UUID:
+        # Вытесняем самый старый ts (FIFO). set в Python сохраняет insertion order
+        oldest = next(iter(_seen_ts[uuid]))
+        _seen_ts[uuid].discard(oldest)
+    seen = _seen_ts[uuid]
+    if ts in seen:
         return True
-    _seen_ts[uuid].add(ts)
+    # Защита: не сохраняем future-ts дальше cutoff_future
+    if ts > cutoff_future:
+        return False  # считаем валидным (он вне окна stale → будет отвергнут выше), но не храним
+    seen.add(ts)
     return False
-
-
-def node_secret(raw_settings_value, secrets_map, uuid: str) -> str:
-    """Per-node секрет приоритетнее глобального."""
-    s = (secrets_map or {}).get(uuid)
-    return (s or "").strip() or (raw_settings_value or "").strip()
 
 
 def sign_payload(secret: str, node_uuid: str, ts: int, metrics_json: str) -> str:
@@ -53,20 +64,24 @@ def sign_payload(secret: str, node_uuid: str, ts: int, metrics_json: str) -> str
 
 
 class AgentReceiver:
-    """Обработка одного отчёта агента."""
-
-    _tables_ready = False
-
+    """Обработка одного отчёта агента. DDL идемпотентен (IF NOT EXISTS),
+    поэтому каждый Receiver пытается ensure_tables при первом репорте —
+    нет необходимости в class-level mutable state."""
     def __init__(self, ctx):
         self._ctx = ctx
+        self._tables_ready = False
+
+    async def _ensure_tables_once(self) -> None:
+        if self._tables_ready:
+            return
+        try:
+            await ensure_tables(self._ctx)
+            self._tables_ready = True
+        except Exception:  # noqa: BLE001 — DDL идемпотентен, повторим на след. репорте
+            self._tables_ready = False
 
     async def handle(self, payload: dict) -> dict:
-        if not AgentReceiver._tables_ready:
-            try:
-                await ensure_tables(self._ctx)
-                AgentReceiver._tables_ready = True
-            except Exception:  # noqa: BLE001 — DDL идемпотентен, повторим на след. репорте
-                pass
+        await self._ensure_tables_once()
         uuid = str(payload.get("node_uuid") or "")
         try:
             ts = int(payload.get("ts") or 0)

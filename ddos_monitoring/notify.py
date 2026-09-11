@@ -235,7 +235,7 @@ async def send_state_change(ctx, node_uuid: str, node_name: str, *,
 async def send_summary(ctx, rows: list[tuple]) -> None:
     """rows: [(uuid, name, state, attack_type, reasons), ...]"""
     counts: dict[str, int] = {}
-    lines = [f"🛡 <b>Состояние инфраструктуры</b>", f"🕒 {_msk_time()}", ""]
+    lines = ["🛡 <b>Состояние инфраструктуры</b>", f"🕒 {_msk_time()}", ""]
     for _uuid, name, state, attack_type, reasons in rows:
         name = escape(name)
         attack_type = escape(attack_type)

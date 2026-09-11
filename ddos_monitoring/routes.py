@@ -16,13 +16,13 @@ def _json(payload: dict, status: int = 200) -> JSONResponse:
 
 
 def build_router(ctx):
-    from fastapi import APIRouter, Depends, HTTPException, Body
+    from fastapi import APIRouter, Depends, Body
     from starlette.requests import Request
 
     from web.backend.core.plugin_api import auth_deps
 
     from . import data
-    from .poller import POLLER, STALE_AFTER_S
+    from .poller import POLLER
 
     AdminUser, require_permission = auth_deps()
     router = APIRouter()
