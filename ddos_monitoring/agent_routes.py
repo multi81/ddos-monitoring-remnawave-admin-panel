@@ -9,6 +9,68 @@ import time
 from .agent_installer import build_install_script, AGENT_VERSION
 
 
+def _node_info_from_report(uuid: str, name, AR) -> dict:
+    """Собрать инфо-объект ноды: имя + online + agent_version из _last_report.
+
+    Если репорта не было — online=False, agent_version=None. Имя берётся
+    из любого доступного источника (panel_api или прямой SQL к nodes).
+    """
+    info = AR._last_report.get(uuid)
+    if not info:
+        return {"name": name, "online": False, "agent_version": None}
+    age = time.time() - info["ts"]
+    return {
+        "name": name,
+        "online": age <= AR.ONLINE_WINDOW_S,
+        "last_seen_age_s": int(age),
+        "agent_version": info.get("agent_version"),
+    }
+
+
+async def agent_status_impl(ctx) -> dict:
+    """Ядро /agent/status: panel_api → fallback на прямой SQL к таблице nodes.
+
+    Ядро Remnawave /api/nodes иногда возвращает не все ноды (особенность
+    фильтрации по полям raw_data/xray_version/traffic — наблюдалось на
+    82.38.96.91). Чтобы /agent/ui показывал все ноды (даже без агента),
+    дополняем результат прямым SQL-запросом к public.nodes.
+    """
+    from . import agent_receiver as AR
+    from web.backend.core.plugin_api import panel_api
+
+    out: dict[str, dict] = {}
+
+    # 1) Основной источник — panel_api (с именами и кэшированием ядра)
+    try:
+        nodes_res = await panel_api().get_nodes()
+        rows = nodes_res.get("response", []) if isinstance(nodes_res, dict) else []
+        for row in rows:
+            uuid = str(row.get("uuid") or "")
+            if not uuid:
+                continue
+            out[uuid] = _node_info_from_report(uuid, row.get("name"), AR)
+    except Exception:  # noqa: BLE001 — fallback ниже всё равно спасёт
+        pass
+
+    # 2) Fallback — прямой SQL к таблице nodes. Если uuid есть в БД, но
+    # не пришёл из panel_api, добавляем с online=False.
+    try:
+        db = getattr(ctx, "db", None)
+        if db is not None:
+            db_rows = await db.fetch(
+                "SELECT uuid::text, name FROM public.nodes "
+                "WHERE is_disabled = false")
+            for row in db_rows:
+                uuid = str(row["uuid"])
+                if uuid in out:
+                    continue
+                out[uuid] = _node_info_from_report(uuid, row["name"], AR)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {"agent_version": AGENT_VERSION, "nodes": out}
+
+
 def register_agent_routes(router, *, ctx, Body, permission_factory):
     """Регистрация в PluginAPIRouter плагина.
 
@@ -20,27 +82,7 @@ def register_agent_routes(router, *, ctx, Body, permission_factory):
 
     @router.get("/agent/status", summary="Статус ddos-agent по нодам (ddos:view)")
     async def agent_status(_admin: object = Depends(permission_factory("ddos", "view"))):
-        from . import agent_receiver as AR
-        from web.backend.core.plugin_api import panel_api
-
-        nodes_res = await panel_api().get_nodes()
-        rows = nodes_res.get("response", []) if isinstance(nodes_res, dict) else []
-        out = {}
-        for row in rows:
-            uuid = str(row.get("uuid") or "")
-            info = AR._last_report.get(uuid)
-            if not info:
-                out[uuid] = {"name": row.get("name"), "online": False,
-                             "agent_version": None}
-                continue
-            age = time.time() - info["ts"]
-            out[uuid] = {
-                "name": row.get("name"),
-                "online": age <= AR.ONLINE_WINDOW_S,
-                "last_seen_age_s": int(age),
-                "agent_version": info.get("agent_version"),
-            }
-        return {"agent_version": AGENT_VERSION, "nodes": out}
+        return await agent_status_impl(ctx)
 
     @router.get("/agent/ui", summary="HTML секции «Агент на нодах» (ddos:view)")
     async def agent_ui(_admin: object = Depends(permission_factory("ddos", "view"))):
