@@ -12,7 +12,7 @@ import json
 import time
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS ddos_monitoring_node_state (
@@ -74,6 +74,8 @@ CREATE INDEX IF NOT EXISTS idx_ddos_monitoring_events_created
 
 ALTER TABLE ddos_monitoring_node_state
     ADD COLUMN IF NOT EXISTS agent_version TEXT;
+ALTER TABLE ddos_monitoring_node_state
+    ADD COLUMN IF NOT EXISTS sort_order INT NOT NULL DEFAULT 0;
 """
 
 
@@ -383,7 +385,7 @@ async def fleet_overview(ctx) -> list[dict[str, Any]]:
                WHERE node_uuid = s.node_uuid AND ended_at IS NULL
                ORDER BY started_at DESC LIMIT 1
            ) a ON TRUE
-           ORDER BY s.node_name, s.node_uuid""")
+           ORDER BY s.sort_order, s.node_name, s.node_uuid""")
     if not nodes:
         return []
     # Один bulk-запрос вместо N+N (reviewer suggestion #1: N+1 optimization)
@@ -433,6 +435,21 @@ async def fleet_overview(ctx) -> list[dict[str, Any]]:
             item["history"] = []
         out.append(item)
     return out
+
+
+async def set_node_order(ctx, order: list[dict]) -> None:
+    """Обновить sort_order для списка нод.
+
+    order: [{"node_uuid": "...", "sort_order": 0}, ...]
+    """
+    for item in order:
+        await ctx.db.execute(
+            """UPDATE ddos_monitoring_node_state
+               SET sort_order = $1, updated_at = NOW()
+               WHERE node_uuid = $2::uuid""",
+            int(item["sort_order"]),
+            str(item["node_uuid"]),
+        )
 
 
 # ── Задача #4: drill-down /history ────────────────────────────────

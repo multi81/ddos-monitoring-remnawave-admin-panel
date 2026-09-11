@@ -93,9 +93,9 @@ def test_ensure_schema_idempotent():
     class StrictDB(FakeDB):
         async def fetchval(self, sql, *args):
             self.calls.append(("fetchval", sql[:80], args))
-            return 3  # simulating existing schema_version
+            return 4  # simulating existing schema_version
 
-    ctx = FakeCtx(schema_version=3)
+    ctx = FakeCtx(schema_version=4)
     ctx.db = StrictDB()
 
     initial_calls = len(ctx.db.calls)

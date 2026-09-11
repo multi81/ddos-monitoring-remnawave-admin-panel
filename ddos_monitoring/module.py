@@ -144,6 +144,9 @@ MODULE_JS = r"""
     '  .ddos-spark .dot { fill: var(--ddos-accent); }' +
     '  .ddos-spark[data-empty] { opacity: .35; }' +
     '  .ddos-node-aside { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }' +
+    '  .ddos-sort-btn { cursor: pointer; background: none; border: 1px solid var(--ddos-border); border-radius: 3px;' +
+    '    color: var(--ddos-muted); font-size: 12px; padding: 2px 5px; line-height: 1; transition: all .12s; }' +
+    '  .ddos-sort-btn:hover { color: var(--ddos-accent); border-color: var(--ddos-accent); }' +
     '  .ddos-empty { color: var(--ddos-muted); font-size: 13px; padding: 12px 0; text-align: center; }' +
     '  .ddos-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }' +
     '  .ddos-table th { text-align: left; padding: 8px 10px; font-weight: 500; color: var(--ddos-muted);' +
@@ -484,7 +487,7 @@ MODULE_JS = r"""
         var ago = n.last_seen_at ? fmtAgo(n.last_seen_at) : 'нет среза';
         var version = n.agent_version ? '<small>v' + esc(n.agent_version) + '</small>' : '';
 
-        h += '<div class="ddos-node"' + (under ? ' data-under-attack="1"' : '') + '>' +
+        h += '<div class="ddos-node"' + (under ? ' data-under-attack="1"' : '') + ' data-uuid="' + esc(n.node_uuid) + '">' +
           '<span class="ddos-node-dot" ' + dotState + ' title="' + esc(ago) + '"></span>' +
           '<div class="ddos-node-name">' +
             esc(n.node_name || n.node_uuid) + ' ' + version +
@@ -504,7 +507,10 @@ MODULE_JS = r"""
           '<div class="ddos-spark-wrap">' +
             sparkline(n.history || (n.metrics && n.metrics.history)) +
           '</div>' +
-          '<div class="ddos-node-aside">' + pill +
+          '<div class="ddos-node-aside">' +
+            '<button class="ddos-sort-btn" data-sort="up" title="Вверх">▲</button>' +
+            '<button class="ddos-sort-btn" data-sort="down" title="Вниз">▼</button>' +
+            pill +
             '<span class="ddos-mute" style="font-size:11px;">' + esc(ago) + '</span>' +
           '</div>' +
         '</div>';
@@ -639,6 +645,38 @@ MODULE_JS = r"""
     if (btn && !btn._bound) {
       btn._bound = true;
       btn.addEventListener('click', function () { loadDetails(root); });
+    }
+    // Sort buttons — event delegation
+    var nodesContainer = root.querySelector('.ddos-nodes');
+    if (nodesContainer && !nodesContainer._sortBound) {
+      nodesContainer._sortBound = true;
+      nodesContainer.addEventListener('click', function (e) {
+        var btn = e.target.closest('.ddos-sort-btn');
+        if (!btn) return;
+        var card = btn.closest('.ddos-node');
+        if (!card) return;
+        var dir = btn.getAttribute('data-sort');
+        var parent = card.parentNode;
+        var cards = Array.from(parent.querySelectorAll('.ddos-node'));
+        var idx = cards.indexOf(card);
+        if (dir === 'up' && idx > 0) {
+          parent.insertBefore(card, cards[idx - 1]);
+        } else if (dir === 'down' && idx < cards.length - 1) {
+          parent.insertBefore(card, cards[idx + 1].nextSibling);
+        } else {
+          return;
+        }
+        // Collect new order and POST
+        var newOrder = Array.from(parent.querySelectorAll('.ddos-node')).map(function (el, i) {
+          return { node_uuid: el.getAttribute('data-uuid'), sort_order: i };
+        });
+        fetch(API_BASE + '/nodes/order', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({ order: newOrder }),
+        }).catch(function (err) { console.warn('[ddos] sort save failed', err); });
+      });
     }
   }
   var detailsLoadedOnce = false;

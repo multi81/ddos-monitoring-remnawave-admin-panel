@@ -69,6 +69,27 @@ def build_router(ctx):
         """GET /history?node_uuid=...&range=1h — drill-down для sparkline UI."""
         return _json(await data.history_series(ctx, node_uuid, range))
 
+    @router.post("/nodes/order", summary="Изменить порядок нод (ddos:edit)")
+    async def nodes_order_route(
+        payload: dict,
+        _admin: AdminUser = Depends(require_permission("ddos", "edit")),
+    ):
+        """POST /nodes/order — {"order": [{"node_uuid": "...", "sort_order": 0}, ...]}"""
+        order = payload.get("order")
+        if not isinstance(order, list):
+            return _json({"error": "order must be a list"}, status=400)
+        if len(order) > 500:
+            return _json({"error": "order too large (max 500)"}, status=400)
+        for i, item in enumerate(order):
+            if not isinstance(item, dict) or "node_uuid" not in item or "sort_order" not in item:
+                return _json({"error": f"order[{i}] must have node_uuid and sort_order"}, status=400)
+            try:
+                int(item["sort_order"])
+            except (ValueError, TypeError):
+                return _json({"error": f"order[{i}].sort_order must be int"}, status=400)
+        await data.set_node_order(ctx, order)
+        return _json({"ok": True, "updated": len(order)})
+
     @router.get("/health", summary="Живость плагина")
     async def health(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         from .agent_installer import AGENT_VERSION
