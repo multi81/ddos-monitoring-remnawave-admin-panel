@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -372,6 +373,10 @@ class DdosPoller:
         self.failures = 0
         self._next_allowed = 0.0
         self._tick_lock = asyncio.Lock()
+        self._baseline_lock = asyncio.Lock()
+        self._baseline_computed_at = 0.0  # epoch когда последний раз считали
+        self._baseline_interval_s = 3600.0  # пересчёт раз в час
+        self._baseline_window_days = 7
         self._schema_ready = False
         self._open_attacks: dict[str, int] = {}  # node_uuid → attack_id
         self._last_summary: float = 0.0
@@ -461,14 +466,15 @@ class DdosPoller:
     async def _fetch(self, coro):
         return await asyncio.wait_for(coro, timeout=REQUEST_TIMEOUT_S)
 
-    def _thresholds(self, raw: Any) -> dict[str, float]:
+    def _thresholds(self, raw: Any, baseline: dict[str, float] | None = None) -> dict[str, float]:
         th = dict(DEFAULT_THRESHOLDS)
         if isinstance(raw, dict):
             for key in th:
                 v = raw.get(key)
                 if isinstance(v, (int, float)) and v > 0:
                     th[key] = float(v)
-        return th
+        # Merge с per-node baseline (адаптивные пороги).
+        return _effective_thresholds(th, baseline or {})
 
     def _agent_snapshot(self, uuid: str, max_age_s: float = 90.0) -> dict | None:
         """Свежий агентский срез или None."""
@@ -522,7 +528,10 @@ class DdosPoller:
 
         # Пороги из настроек плагина (админ меняет без передеплоя)
         th_raw = await self._fetch(ctx.settings.get("thresholds"))
-        th = self._thresholds(th_raw)
+        # Per-node baseline (если включён) — вычитываем один раз на tick,
+        # не на каждую ноду (экономит N DB reads на 11+ нод).
+        baseline_enabled_raw = await self._fetch(ctx.settings.get("baseline_mode"))
+        baseline_enabled = bool(baseline_enabled_raw)
 
         # Имена нод — из панели (для /data); uuid → name (M-1).
         # get_nodes() отдаёт {"response": [...]}; терпим и list на всякий случай.
@@ -595,6 +604,16 @@ class DdosPoller:
         for row in rows:
             uuid = str(row["node_uuid"])
             seen.add(uuid)
+            # Reset `th` на КАЖДОЙ ноде — иначе предыдущая нода с baseline
+            # «протечёт» в текущую, если у неё нет baseline row (только что
+            # добавлена, INSERT в node_baseline упал, нет метрик за 7 дней).
+            # Это CRITICAL FIX: иначе ноды без baseline получат ЛИБО СЛИШКОМ
+            # ВЫСОКИЕ пороги → пропустим атаки (false NEGATIVE).
+            th = self._thresholds(th_raw)
+            if baseline_enabled:
+                node_baseline = await self._fetch_baseline(uuid)
+                if node_baseline:
+                    th = self._thresholds(th_raw, node_baseline)
             agent_m = self._agent_snapshot(uuid)
             if agent_m is not None:
                 # Приоритет: живой агент → полный classify
@@ -663,6 +682,9 @@ class DdosPoller:
         # TTL-закрытие зависших attacks (wire L1) — раз в час
         await self._maybe_close_stale(ctx, log)
 
+        # Baseline mode (v0.7.47) — раз в час пересчитываем p95 из истории.
+        await self._maybe_recompute_baseline(ctx, log)
+
         self.as_of = now
         self.error = None
         self.truncated = False
@@ -708,6 +730,97 @@ class DdosPoller:
 
     def classify_agent(self, m):
         return classify_agent(m)
+
+    async def _maybe_recompute_baseline(self, ctx, log: Any) -> None:
+        """Раз в час пересчитывает per-node baseline из node_metrics_snapshots.
+
+        Идея: fastnetmon baseline_magician. Берём историю за 7 дней, агрегируем
+        p95, применяем формулу (value * 3), сохраняем в node_baseline.
+        Защита: lock + try/except (не должен ломать tick).
+        """
+        now = time.time()
+        if now - self._baseline_computed_at < self._baseline_interval_s:
+            return
+        if self._baseline_lock.locked():
+            return
+        async with self._baseline_lock:
+            try:
+                rows = await ctx.db.fetch(
+                    """SELECT node_uuid::text,
+                              percentile_cont(0.95) WITHIN GROUP (ORDER BY net_rx_bps) AS p95_bps,
+                              COUNT(*)::int AS n_bps,
+                              percentile_cont(0.95) WITHIN GROUP (ORDER BY net_rx_pps) AS p95_pps,
+                              COUNT(*)::int AS n_pps,
+                              percentile_cont(0.95) WITHIN GROUP (ORDER BY tcp_syncookies_ps) AS p95_syn,
+                              COUNT(tcp_syncookies_ps)::int AS n_syn,
+                              percentile_cont(0.95) WITHIN GROUP (ORDER BY tcp_listen_drop_ps) AS p95_ld,
+                              COUNT(tcp_listen_drop_ps)::int AS n_ld,
+                              percentile_cont(0.95) WITHIN GROUP (ORDER BY net_rx_drop_ps) AS p95_rxd,
+                              COUNT(net_rx_drop_ps)::int AS n_rxd
+                       FROM node_metrics_snapshots
+                       WHERE created_at > NOW() - ($1::int * interval '1 day')
+                       GROUP BY node_uuid""",
+                    self._baseline_window_days)
+                written = 0
+                for r in rows:
+                    uuid = str(r["node_uuid"])
+                    samples = [
+                        ("net_rx_bps", r["p95_bps"], r["n_bps"], "rx_bps"),
+                        ("net_rx_pps", r["p95_pps"], r["n_pps"], "rx_pps"),
+                        ("tcp_syncookies_ps", r["p95_syn"], r["n_syn"], "syncookies_ps"),
+                        ("tcp_listen_drop_ps", r["p95_ld"], r["n_ld"], "listen_drop_ps"),
+                        ("net_rx_drop_ps", r["p95_rxd"], r["n_rxd"], "rx_drop_ps"),
+                    ]
+                    for src_key, p95_v, n_v, bl_key in samples:
+                        if p95_v is None or n_v == 0:
+                            continue
+                        try:
+                            scaled = _apply_expression(float(p95_v),
+                                                       _DEFAULT_EXPRESSIONS.get(bl_key, "value * 3"))
+                        except (ValueError, SyntaxError, ZeroDivisionError):
+                            continue
+                        baseline_v = max(scaled, _DEFAULT_MIN.get(bl_key, 0.0))
+                        await ctx.db.execute(
+                            """INSERT INTO ddos_monitoring_node_baseline
+                                  (node_uuid, metric, baseline_value, p95_value,
+                                   samples_count, window_days, computed_at)
+                               VALUES ($1::uuid, $2, $3, $4, $5, $6, NOW())
+                               ON CONFLICT (node_uuid, metric) DO UPDATE
+                                   SET baseline_value = EXCLUDED.baseline_value,
+                                       p95_value = EXCLUDED.p95_value,
+                                       samples_count = EXCLUDED.samples_count,
+                                       computed_at = EXCLUDED.computed_at""",
+                            uuid, bl_key, baseline_v, float(p95_v), int(n_v),
+                            self._baseline_window_days)
+                        written += 1
+                self._baseline_computed_at = time.time()
+                if written:
+                    log.info("ddos-monitoring: baseline recomputed, %d rows written (window=%dd)",
+                             written, self._baseline_window_days)
+            except Exception as _e:  # noqa: BLE001
+                log.warning("ddos-monitoring: baseline recompute failed: %s", _e)
+
+    async def _recompute_baseline_one_off(self, ctx, log: Any) -> None:
+        """Принудительный пересчёт baseline (для ручного триггера из API)."""
+        self._baseline_computed_at = 0.0
+        await self._maybe_recompute_baseline(ctx, log)
+
+    async def _fetch_baseline(self, uuid: str) -> dict[str, float] | None:
+        """Возвращает {metric: baseline_value} для uuid из node_baseline."""
+        try:
+            ctx = _ctx_ref()
+            if not ctx or not getattr(ctx, "db", None):
+                return None
+            rows = await ctx.db.fetch(
+                "SELECT metric, baseline_value FROM ddos_monitoring_node_baseline "
+                "WHERE node_uuid = $1::uuid",
+                uuid,
+            )
+            if not rows:
+                return None
+            return {str(r["metric"]): float(r["baseline_value"]) for r in rows}
+        except Exception:  # noqa: BLE001
+            return None
 
     async def _restore_states_safe(self, log: Any) -> None:
         """Обёртка: восстановление вердиктов после старта процесса."""
@@ -996,6 +1109,110 @@ class DdosPoller:
         entry.pop("duration_for_notify", None)
         if observed == "attack" and not entry.get("attack_started_at"):
             entry["attack_started_at"] = now
+
+
+# ── Baseline mode (v0.7.47) — адаптивные пороги на основе истории трафика.
+# ────────────────────────────────────────────────────────────────
+# Идея из fastnetmon (baseline_magician + influxdb_baseline):
+#   - берём историю `node_metrics_snapshots` за N дней (default 7)
+#   - агрегируем p95 (или другая функция)
+#   - применяем выражение: value * K, value + N
+#   - ограничиваем снизу min_threshold
+# Детекция использует max(DEFAULT_THRESHOLDS, baseline) — нижняя граница +
+# адаптация под реальный профиль ноды.
+
+_VALID_BASELINE_KEYS = ("rx_bps", "rx_pps", "syncookies_ps", "listen_drop_ps", "rx_drop_ps")
+_DEFAULT_EXPRESSIONS = {
+    "rx_bps": "value * 3",
+    "rx_pps": "value * 2",
+    "syncookies_ps": "value + 5",
+    "listen_drop_ps": "value + 3",
+    "rx_drop_ps": "value + 3",
+}
+_DEFAULT_MIN = {
+    "rx_bps": 20_000_000.0,
+    "rx_pps": 5_000.0,
+    "syncookies_ps": 10.0,
+    "listen_drop_ps": 5.0,
+    "rx_drop_ps": 5.0,
+}
+
+
+def _apply_expression(value: float, expression: str) -> float:
+    """Применяет формулу типа 'value * 3' или 'value + 200'. Защита от инъекций."""
+    s = expression.strip()
+    if len(s) > 256:
+        raise ValueError(f"expression too long: {len(s)} > 256")
+    if "value" not in s:
+        raise ValueError(f"expression must contain 'value': {expression!r}")
+    safe = s.replace("value", str(float(value)))
+    # Разрешаем только [0-9+\-*/(). ]
+    if not re.fullmatch(r"[\d+\-*/().\s]+", safe):
+        raise ValueError(f"unsafe expression: {expression!r}")
+    try:
+        return float(eval(safe, {"__builtins__": {}}, {}))
+    except ZeroDivisionError as e:
+        raise ValueError(f"division by zero: {expression!r}") from e
+
+
+def _compute_baseline_from_samples(
+    samples: list[tuple[str, dict]],
+    *,
+    expressions: dict[str, str] | None = None,
+    min_threshold: dict[str, float] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Вычисляет per-uuid baseline из raw samples.
+
+    :param samples: [(node_uuid, metrics_dict), ...]
+    :param expressions: per-metric формула (default _DEFAULT_EXPRESSIONS)
+    :param min_threshold: per-metric нижняя граница (default _DEFAULT_MIN)
+    :returns: {node_uuid: {metric: baseline_value}}
+    """
+    exprs = {**_DEFAULT_EXPRESSIONS, **(expressions or {})}
+    mn = {**_DEFAULT_MIN, **(min_threshold or {})}
+    grouped: dict[str, list[float]] = {}
+    key_to_metric = {
+        "rx_bps": "net_rx_bps", "rx_pps": "net_rx_pps",
+        "syncookies_ps": "tcp_syncookies_ps",
+        "listen_drop_ps": "tcp_listen_drop_ps",
+        "rx_drop_ps": "net_rx_drop_ps",
+    }
+    for uuid, m in samples:
+        for bl_key, src_key in key_to_metric.items():
+            v = m.get(src_key)
+            if v is None:
+                continue
+            grouped.setdefault(f"{uuid}|{bl_key}", []).append(float(v))
+    out: dict[str, dict[str, float]] = {}
+    for k, vs in grouped.items():
+        uuid, bl_key = k.split("|", 1)
+        if not vs:
+            continue
+        sv = sorted(vs)
+        p95_idx = max(0, int(round(0.95 * (len(sv) - 1))))
+        p95 = sv[p95_idx]
+        expr = exprs.get(bl_key, "value * 3")
+        mn_v = mn.get(bl_key, 0.0)
+        try:
+            scaled = _apply_expression(p95, expr)
+        except (ValueError, SyntaxError):
+            continue
+        out.setdefault(uuid, {})[bl_key] = max(scaled, mn_v)
+    return out
+
+
+def _effective_thresholds(
+    default: dict[str, float],
+    baseline: dict[str, float] | None,
+) -> dict[str, float]:
+    """Возвращает max(default[k], baseline[k] if any else default[k])."""
+    if not baseline:
+        return dict(default)
+    eff = {}
+    for k, dv in default.items():
+        bv = baseline.get(k)
+        eff[k] = max(dv, bv) if bv is not None else dv
+    return eff
 
 
 # Замыкание на контекст плагина: _build сохраняет ctx сюда до первого тика.

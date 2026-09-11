@@ -50,7 +50,12 @@ class FakeDB:
         await self._guard()
         q = query.strip().lower()
         if q.startswith("insert into plugin_settings"):
-            self.settings[(args[0], "schema_version")] = args[1] if len(args) == 2 else args[-1]
+            # Современная схема: args = (plugin_id, key, value[, value_type])
+            # Устаревший формат: args = (plugin_id, value) с literal 'schema_version' в SQL
+            if len(args) == 2:
+                self.settings[(args[0], "schema_version")] = args[1]
+            else:
+                self.settings[(args[0], args[1])] = args[2]
         elif q.startswith("update ddos_monitoring_attacks"):
             pass  # достаточно отсутствия исключения
         elif q.startswith("insert into ddos_monitoring_events"):

@@ -12,7 +12,7 @@ import json
 import time
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS ddos_monitoring_node_state (
@@ -23,6 +23,19 @@ CREATE TABLE IF NOT EXISTS ddos_monitoring_node_state (
     last_error TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS ddos_monitoring_node_baseline (
+    node_uuid UUID NOT NULL,
+    metric TEXT NOT NULL,
+    baseline_value DOUBLE PRECISION NOT NULL,
+    p95_value DOUBLE PRECISION NOT NULL,
+    samples_count INT NOT NULL DEFAULT 0,
+    window_days INT NOT NULL DEFAULT 7,
+    computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (node_uuid, metric)
+);
+CREATE INDEX IF NOT EXISTS idx_ddos_monitoring_node_baseline_computed
+    ON ddos_monitoring_node_baseline(computed_at);
 
 CREATE TABLE IF NOT EXISTS ddos_monitoring_attacks (
     id BIGSERIAL PRIMARY KEY,
@@ -140,19 +153,45 @@ async def top_sources(ctx, limit: int = 50,
 
 
 async def ensure_schema(ctx) -> None:
-    """Идемпотентное применение DDL + журнал версии. Вызывается из тика."""
+    """Идемпотентное применение DDL + журнал версии. Вызывается из тика.
+
+    Также инициализирует дефолтные plugin_settings при первой установке —
+    админу не нужно вручную делать INSERT в БД.
+    """
     applied = await ctx.db.fetchval(
         "SELECT value FROM plugin_settings WHERE plugin_id = $1 AND key = $2",
         ctx.plugin_id, "schema_version",
     )
-    if applied is not None and int(applied) >= SCHEMA_VERSION:
-        return
-    await ctx.db.execute(_DDL)
+    if applied is None or int(applied) < SCHEMA_VERSION:
+        await ctx.db.execute(_DDL)
+        await ctx.db.execute(
+            """INSERT INTO plugin_settings (plugin_id, key, value, updated_at)
+               VALUES ($1, 'schema_version', $2::jsonb, NOW())
+               ON CONFLICT (plugin_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+            ctx.plugin_id, str(SCHEMA_VERSION),
+        )
+
+    # Дефолтные настройки плагина (idempotent — ON CONFLICT ничего не делает,
+    # если значение уже есть; админ может поменять через UI/SQL позже).
+    # baseline_mode выключен по умолчанию (opt-in), чтобы не ломать поведение
+    # при апгрейде с v0.7.46.
+    await _ensure_plugin_setting(ctx, "baseline_mode", "false", "boolean")
+    await _ensure_plugin_setting(ctx, "baseline_window_days", "7", "number")
+    await _ensure_plugin_setting(ctx, "baseline_p95", "0.95", "number")
+
+
+async def _ensure_plugin_setting(ctx, key: str, default_value: str, value_type: str) -> None:
+    """Upsert настройки плагина с дефолтом. Не перезаписывает существующие.
+
+    Используется при ensure_schema: первый запуск после установки wheel
+    создаёт записи, последующие — no-op.
+    """
     await ctx.db.execute(
-        """INSERT INTO plugin_settings (plugin_id, key, value, updated_at)
-           VALUES ($1, 'schema_version', $2::jsonb, NOW())
-           ON CONFLICT (plugin_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
-        ctx.plugin_id, str(SCHEMA_VERSION),
+        """INSERT INTO plugin_settings
+               (plugin_id, key, value, value_type, updated_at)
+           VALUES ($1, $2, $3::jsonb, $4, NOW())
+           ON CONFLICT (plugin_id, key) DO NOTHING""",
+        ctx.plugin_id, key, default_value, value_type,
     )
 
 
