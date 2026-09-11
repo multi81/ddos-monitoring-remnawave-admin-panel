@@ -16,34 +16,26 @@ def _json(payload: dict, status: int = 200) -> JSONResponse:
 
 
 def build_router(ctx):
-    from fastapi import APIRouter, Depends, Body
-    from starlette.requests import Request
+    from fastapi import APIRouter, Depends, HTTPException, Body
 
     from web.backend.core.plugin_api import auth_deps
 
     from . import data
-    from .poller import POLLER
+    from .poller import POLLER, STALE_AFTER_S
 
     AdminUser, require_permission = auth_deps()
     router = APIRouter()
 
     @router.post("/agent/report", summary="Срез ddos-agent: HMAC, без админ-сессии",
                  include_in_schema=False)
-    async def agent_report(request: Request, payload: dict | None = Body(default=None)):
-        """Публичный endpoint для агентов. Авторизация — только HMAC-подпись.
-
-        FastAPI: request имеет явный тип Request (иначе DI не подставит).
-        payload — из тела запроса через Body(...). Если None — пытаемся распарсить
-        JSON вручную как fallback.
-        """
+    async def agent_report(request=None, payload: dict = None):
+        """Публичный endpoint для агентов. Авторизация — только HMAC-подпись."""
         from .agent_receiver import AgentReceiver
         if payload is None:
             try:
                 payload = await request.json()
             except Exception:
                 return _json({"saved": False, "error": "bad_payload"}, status=400)
-        if not isinstance(payload, dict):
-            return _json({"saved": False, "error": "bad_payload"}, status=400)
         res = await AgentReceiver(ctx).handle(payload)
         return _json(res, status=200 if res.get("saved") else 400)
 
@@ -72,14 +64,14 @@ def build_router(ctx):
         from .agent_installer import AGENT_VERSION
         return _json({"ok": True, "version": AGENT_VERSION})
 
-    @router.get("/ui-module", summary="UI-модуль для /plugins/:pluginId")
+    @router.get("/ui-module", summary="UI-модуль для /plugins/:pluginId (ddos:view)")
     async def ui_module(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         from .module import MODULE_JS
         from fastapi.responses import Response
         return Response(MODULE_JS, media_type="application/javascript; charset=utf-8",
                         headers=_NO_STORE)
 
-    @router.get("/tg", summary="Настройки Telegram: маскированный токен + chat_ids")
+    @router.get("/tg", summary="Настройки Telegram: маскированный токен + chat_ids (ddos:view)")
     async def tg_get(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         from .tg_bot import _as_str, _chat_ids, mask_token
         token = _as_str(await ctx.settings.get("tg_bot_token"))
@@ -147,7 +139,7 @@ def build_router(ctx):
         via = "panel" if state["sent"] == 0 and ctx.panel_calls else "bot"
         return _json({"sent": state["sent"], "via": via})
 
-    @router.get("/ui", summary="Standalone-страница (панели <4.5.4, без generic-маршрута)")
+    @router.get("/ui", summary="Standalone-страница (панели <4.5.4, без generic-маршрута, ddos:view)")
     async def ui_page(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         from .page import PAGE_HTML
         from fastapi.responses import HTMLResponse

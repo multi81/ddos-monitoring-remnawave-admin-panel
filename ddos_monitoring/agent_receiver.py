@@ -2,12 +2,12 @@
 
 Панель не трогаем — endpoint регистрируется роутером плагина.
 """
-from __future__ import annotations
 
 import hashlib
 import hmac
 import json
 import time
+from asyncio import Lock
 
 # Окно свежести ts (сек) — защита от replay
 STALE_WINDOW_S = 120
@@ -15,47 +15,74 @@ STALE_WINDOW_S = 120
 ONLINE_WINDOW_S = 90
 
 # Реестр последних валидных репортов: uuid -> {ts, agent_version, metrics}
+# Лимит защищает от распухания при спуфинге node_uuid (компрометация секрета).
 _last_report: dict = {}
+_LAST_REPORT_MAX = 4096
 # Replay-защита: последние виденные ts per node (окно STALE_WINDOW_S).
 # Лимит uuid защищает от распухания карты при спуфинге node_uuid.
-# set-значение ограничено: вытесняем ts, которые (a) устарели (old than cutoff)
-# или (b) слишком в будущем (future drift ≥ STALE_WINDOW_S — защита от OOM-атаки).
 _seen_ts: dict = {}
 _SEEN_MAX_UUIDS = 4096
-# Лимит размера set'a per uuid (защита от долгоживущих future ts)
-_SEEN_MAX_TS_PER_UUID = 256
+
+# Per-uuid lock для защиты от TOCTOU между check и add при конкурентных POST
+# (M3). Имеет смысл только при concurrent requests с одинаковым ts+uuid.
+_REPLAY_LOCKS: dict[str, Lock] = {}
+_REPLAY_LOCKS_MAX = 4096
 
 
-def _check_replay(uuid: str, ts: int) -> bool:
-    """True = дубликат. Защита от будущих ts (OOM-вектор):
-    ts дальше чем now + STALE_WINDOW_S считаем уже валидным, не храним.
+def _evict_oldest(d: dict) -> None:
+    """FIFO eviction — вытеснить самый старый ключ (первый в insertion order)."""
+    if d:
+        d.pop(next(iter(d)), None)
+
+
+def _lock_for(uuid: str) -> Lock:
+    """Получить/создать per-uuid asyncio.Lock с FIFO cap."""
+    lock = _REPLAY_LOCKS.get(uuid)
+    if lock is None:
+        if len(_REPLAY_LOCKS) >= _REPLAY_LOCKS_MAX:
+            _evict_oldest(_REPLAY_LOCKS)
+        lock = Lock()
+        _REPLAY_LOCKS[uuid] = lock
+    return lock
+
+
+async def _check_replay(uuid: str, ts: int) -> bool:
+    """True = дубликат. Async + per-uuid Lock → TOCTOU-safe (M3).
+
+    Cutoff: храним только ts ∈ (now - STALE_WINDOW_S, now + STALE_WINDOW_S).
+    Future ts (> now + STALE_WINDOW_S) — НЕ сохраняем, иначе set растёт бесконечно
+    (OOM-атака при спуфинге секрета).
     """
     now = time.time()
-    seen = _seen_ts.get(uuid)
-    if seen is None:
-        # Лимит количества uuid: вытесняем самый старый ключ (FIFO по вставке)
-        if len(_seen_ts) >= _SEEN_MAX_UUIDS:
-            oldest = next(iter(_seen_ts))
-            _seen_ts.pop(oldest, None)
-        _seen_ts[uuid] = set()
-        seen = _seen_ts[uuid]
-    # чистка устаревших + future-drift
-    cutoff_old = now - STALE_WINDOW_S
-    cutoff_future = now + STALE_WINDOW_S
-    _seen_ts[uuid] = {t for t in seen if cutoff_old <= t <= cutoff_future}
-    # Лимит размера set'а per uuid (на случай ОЧЕНЬ долгой жизни ключа)
-    if len(_seen_ts[uuid]) >= _SEEN_MAX_TS_PER_UUID:
-        # Вытесняем самый старый ts (FIFO). set в Python сохраняет insertion order
-        oldest = next(iter(_seen_ts[uuid]))
-        _seen_ts[uuid].discard(oldest)
-    seen = _seen_ts[uuid]
-    if ts in seen:
-        return True
-    # Защита: не сохраняем future-ts дальше cutoff_future
-    if ts > cutoff_future:
-        return False  # считаем валидным (он вне окна stale → будет отвергнут выше), но не храним
-    seen.add(ts)
-    return False
+    lock = _lock_for(uuid)
+    async with lock:
+        seen = _seen_ts.get(uuid)
+        if seen is None:
+            if len(_seen_ts) >= _SEEN_MAX_UUIDS:
+                _evict_oldest(_seen_ts)
+            _seen_ts[uuid] = set()
+            seen = _seen_ts[uuid]
+        lower = now - STALE_WINDOW_S
+        upper = now + STALE_WINDOW_S
+        _seen_ts[uuid] = {t for t in seen if lower < t < upper}
+        if ts in _seen_ts[uuid]:
+            return True
+        # Future ts вне окна — не сохраняем (OOM protection)
+        if ts <= lower or ts >= upper:
+            return False
+        _seen_ts[uuid].add(ts)
+        return False
+
+
+def _save_last_report(uuid: str, payload: dict, ts: int) -> None:
+    """Сохранить последний репорт. FIFO cap при переполнении (M2)."""
+    if len(_last_report) >= _LAST_REPORT_MAX:
+        _evict_oldest(_last_report)
+    _last_report[uuid] = {
+        "ts": ts,
+        "agent_version": str(payload.get("agent_version") or ""),
+        "metrics": payload["metrics"],
+    }
 
 
 def sign_payload(secret: str, node_uuid: str, ts: int, metrics_json: str) -> str:
@@ -64,24 +91,19 @@ def sign_payload(secret: str, node_uuid: str, ts: int, metrics_json: str) -> str
 
 
 class AgentReceiver:
-    """Обработка одного отчёта агента. DDL идемпотентен (IF NOT EXISTS),
-    поэтому каждый Receiver пытается ensure_tables при первом репорте —
-    нет необходимости в class-level mutable state."""
+    """Обработка одного отчёта агента."""
+
     def __init__(self, ctx):
         self._ctx = ctx
-        self._tables_ready = False
-
-    async def _ensure_tables_once(self) -> None:
-        if self._tables_ready:
-            return
-        try:
-            await ensure_tables(self._ctx)
-            self._tables_ready = True
-        except Exception:  # noqa: BLE001 — DDL идемпотентен, повторим на след. репорте
-            self._tables_ready = False
+        self._tables_ready = False  # instance-level (race-free)
 
     async def handle(self, payload: dict) -> dict:
-        await self._ensure_tables_once()
+        if not self._tables_ready:
+            try:
+                await ensure_tables(self._ctx)
+                self._tables_ready = True
+            except Exception:  # noqa: BLE001 — DDL идемпотентен, повторим на след. репорте
+                pass
         uuid = str(payload.get("node_uuid") or "")
         try:
             ts = int(payload.get("ts") or 0)
@@ -102,7 +124,7 @@ class AgentReceiver:
         got = str(payload.get("sig") or "")
         if not hmac.compare_digest(expect, got):
             return {"saved": False, "error": "bad_signature"}
-        if _check_replay(uuid, ts):
+        if await _check_replay(uuid, ts):
             return {"saved": False, "error": "replay"}
 
         await self._ctx.db.execute(
@@ -142,11 +164,7 @@ class AgentReceiver:
                  SET last_seen = EXCLUDED.last_seen, agent_version = EXCLUDED.agent_version""",
             uuid, ts, str(payload.get("agent_version") or ""),
         )
-        _last_report[uuid] = {
-            "ts": ts,
-            "agent_version": str(payload.get("agent_version") or ""),
-            "metrics": payload["metrics"],
-        }
+        _save_last_report(uuid, payload, ts)
         return {"saved": True}
 
 

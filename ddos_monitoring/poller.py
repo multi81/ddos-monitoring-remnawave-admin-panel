@@ -433,7 +433,10 @@ class DdosPoller:
         log = log or logger
         if not self._restored:
             self._restored = True
-            self._restore_task = asyncio.create_task(self._restore_states_safe(log))
+            # L2: restore — последовательно ПЕРЕД первым тиком (без fire-and-forget).
+            # Иначе restore и _tick_impl писали бы в self._nodes/_open_attacks
+            # параллельно и могли бы рассинхронизировать состояние.
+            await self._restore_states_safe(log)
         if self._tick_lock.locked():
             log.warning("ddos-monitoring: previous tick still running — skipped")
             return
