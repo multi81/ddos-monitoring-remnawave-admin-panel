@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ddos-monitoring"
-version = "0.7.53"
+version = "0.7.54"
 description = "DDoS-мониторинг для remnawave-admin: телеметрия нод, детект атак, история, TG-алерты"
 readme = "README.md"
 license = { text = "MIT" }
