@@ -513,8 +513,9 @@ async def history_series(
 
     Задача handoff.md #4.
     """
-    if not _UUID_RE.match(node_uuid):
-        raise ValueError(f"Invalid node_uuid format: {node_uuid!r}")
+    node_uuid_str = str(node_uuid) if not isinstance(node_uuid, str) else node_uuid
+    if not _UUID_RE.match(node_uuid_str):
+        raise ValueError(f"Invalid node_uuid format: {node_uuid_str!r}")
 
     range_seconds = _parse_range_seconds(range_str)
     now_ms = int(_time.time() * 1000)
@@ -525,7 +526,7 @@ async def history_series(
            FROM ddos_monitoring_agent_snapshots
            WHERE node_uuid = $1::uuid AND ts >= $2::bigint
            ORDER BY ts ASC""",
-        node_uuid, since_ms,
+        node_uuid_str, since_ms,
     )
 
     ts_list: list[str] = []
@@ -544,7 +545,7 @@ async def history_series(
         rx_mbps.append(round(int(r["rx_bps"] or 0) / 1_000_000, 1))
 
     return {
-        "node_uuid": node_uuid,
+        "node_uuid": node_uuid_str,
         "range": range_str,
         "step_s": _compute_step_s(ts_list),
         "series": {
