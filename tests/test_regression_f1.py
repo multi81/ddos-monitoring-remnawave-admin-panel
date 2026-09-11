@@ -34,7 +34,14 @@ def test_build_binds_ctx(monkeypatch):
 
     from ddos_monitoring.poller import _ctx_ref
     assert _ctx_ref() is ctx
-    assert len(parts.scheduled_tasks) == 1
+    # В 0.7.28+ есть 2 periodic-задачи: ddos-agent-secret-init + ddos-poll.
+    # Тест устарел с момента добавления второй задачи — фикс.
+    assert len(parts.scheduled_tasks) == 2
+    task_names = {t["name"] for t in parts.scheduled_tasks}
+    assert "ddos-poll" in task_names, "ddos-poll task должна быть"
+    assert "ddos-agent-secret-init" in task_names, (
+        "ddos-agent-secret-init task должна быть"
+    )
 
 
 async def test_real_tick_works_after_bind(monkeypatch):

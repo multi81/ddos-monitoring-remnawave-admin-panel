@@ -48,7 +48,7 @@ def build_router(ctx):
         return _json(res, status=200 if res.get("saved") else 400)
 
     @router.get("/data", summary="Флот: состояние нод, активные атаки, статус poller (ddos:view)")
-    async def data_route():
+    async def data_route(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         state = POLLER.public_state()
         payload = {
             "poller": state,
@@ -59,7 +59,7 @@ def build_router(ctx):
         return _json(payload)
 
     @router.get("/details", summary="Расшифровка вердикта по нодам: systemd, Лимит IP топ, метрики (ddos:view)")
-    async def details_route():
+    async def details_route(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         names = {str(r["uuid"]): r["name"] for r in await ctx.db.fetch("select uuid, name from nodes")}
         out = []
         for d in await data.node_details(ctx):
@@ -68,19 +68,19 @@ def build_router(ctx):
         return _json({"nodes": out})
 
     @router.get("/health", summary="Живость плагина")
-    async def health():
+    async def health(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         from .agent_installer import AGENT_VERSION
         return _json({"ok": True, "version": AGENT_VERSION})
 
     @router.get("/ui-module", summary="UI-модуль для /plugins/:pluginId")
-    async def ui_module():
+    async def ui_module(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         from .module import MODULE_JS
         from fastapi.responses import Response
         return Response(MODULE_JS, media_type="application/javascript; charset=utf-8",
                         headers=_NO_STORE)
 
     @router.get("/tg", summary="Настройки Telegram: маскированный токен + chat_ids")
-    async def tg_get():
+    async def tg_get(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         from .tg_bot import _as_str, _chat_ids, mask_token
         token = _as_str(await ctx.settings.get("tg_bot_token"))
         raw = _as_str(await ctx.settings.get("tg_chat_ids"))
@@ -148,7 +148,7 @@ def build_router(ctx):
         return _json({"sent": state["sent"], "via": via})
 
     @router.get("/ui", summary="Standalone-страница (панели <4.5.4, без generic-маршрута)")
-    async def ui_page():
+    async def ui_page(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         from .page import PAGE_HTML
         from fastapi.responses import HTMLResponse
         return HTMLResponse(PAGE_HTML, headers=_NO_STORE)

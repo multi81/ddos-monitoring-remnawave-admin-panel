@@ -87,10 +87,25 @@ def _build_with_fake_deps(monkeypatch):
 
 
 def test_every_route_declares_permission(monkeypatch):
+    """Каждая ручка должна требовать require_permission('ddos', ...),
+    за исключением публичных agent endpoints с HMAC-авторизацией."""
     router = _build_with_fake_deps(monkeypatch)
     assert len(router.routes) >= 3
+
+    # Список публичных endpoint'ов — авторизация через HMAC (см. agent_receiver.py).
+    # Эти намеренно БЕЗ require_permission().
+    PUBLIC_PATHS = {"/agent/report"}
+
     for path, fn, _summary in router.routes:
-        # зависимость — это default параметра-ручки (Depends(require_permission(...)))
+        if path in PUBLIC_PATHS:
+            # У публичной ручки НЕ должно быть ddos-permission (HMAC вместо).
+            assert fn.__defaults__ is None or not any(
+                isinstance(d, tuple) and d and d[0] == "dep"
+                and getattr(d[1], "resource", None) == "ddos"
+                for d in (fn.__defaults__ or ())
+            ), f"публичная ручка {path} не должна иметь require_permission('ddos')"
+            continue
+
         defaults = fn.__defaults__ or ()
         has_dep = any(isinstance(d, tuple) and d and d[0] == "dep"
                       and getattr(d[1], "resource", None) == "ddos"

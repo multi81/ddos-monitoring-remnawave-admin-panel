@@ -18,8 +18,8 @@ def register_agent_routes(router, *, ctx, Body, permission_factory):
 
     from fastapi import Depends, HTTPException
 
-    @router.get("/agent/status", summary="Статус ddos-agent по нодам")
-    async def agent_status():
+    @router.get("/agent/status", summary="Статус ddos-agent по нодам (ddos:view)")
+    async def agent_status(_admin: object = Depends(permission_factory("ddos", "view"))):
         from . import agent_receiver as AR
         from web.backend.core.plugin_api import panel_api
 
@@ -42,8 +42,8 @@ def register_agent_routes(router, *, ctx, Body, permission_factory):
             }
         return {"agent_version": AGENT_VERSION, "nodes": out}
 
-    @router.get("/agent/ui", summary="HTML секции «Агент на нодах» (без авторизации — для UI)")
-    async def agent_ui():
+    @router.get("/agent/ui", summary="HTML секции «Агент на нодах» (ddos:view)")
+    async def agent_ui(_admin: object = Depends(permission_factory("ddos", "view"))):
         from fastapi.responses import HTMLResponse
         from .module import render_agent
         try:
