@@ -4,250 +4,233 @@
 
 **DDoS-мониторинг для [remnawave-admin](https://github.com/Case211/remnawave-admin)**
 
-[![Plugin API v1](https://img.shields.io/badge/Plugin%20API-v1-blue)]()
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)]()
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)]()
-[![Tests](https://img.shields.io/badge/tests-123%20passed-brightgreen)]()
+[![Plugin API v1](https://img.shields.io/badge/Plugin%20API-v1-blue)](https://github.com/Case211/remnawave-admin)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Телеметрия нод → детект атак → история → TG-алерты.
-Полностью встроенный плагин: **без SSH, без внешних зависимостей, без отдельного сервера мониторинга.**
+[English](#english) | [Русский](#русский)
 
 </div>
 
 ---
 
-## Что это
+## Русский
 
-Плагин для панели remnawave-admin, который превращает её в полноценный DDoS-монитор:
+### Что это
 
-- **Агент на каждой ноде** — лёгкий Python-скрипт без зависимостей, собирает метрики из `/proc` и отправляет в панель
-- **Poller в панели** — читает телеметрию из БД, детектит атаки по порогам с подтверждениями
-- **Встроенный UI** — дашборд прямо в админке: ноды, атаки, расшифровка вердиктов
-- **Telegram-бот** — алерты с детализацией: тип атаки, severity, метрики, топ IP
-- **Автоустановка** — агент ставится на ноды через `exec_script` канала панели, одним кликом
+Плагин для remnawave-admin (Plugin API v1), который мониторит ноды на DDoS-атаки и системные проблемы. Данные поступают от **ddos-agent** (устанавливается на ноды) через WebSocket-канал панели → `node_metrics_snapshots` → плагин читает и анализирует.
 
-## Архитектура
+### Архитектура
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    remnawave-admin                       │
+│  remnawave-admin panel                                  │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │ ddos-monitoring plugin                          │    │
+│  │  ├─ Poller (каждые 20с)                         │    │
+│  │  │   ├─ читает node_metrics_snapshots           │    │
+│  │  │   ├─ читает ddos-agent snapshots             │    │
+│  │  │   ├─ classify() → attack/stable/load/health  │    │
+│  │  │   ├─ baseline: p95×3 за 7 дней               │    │
+│  │  │   └─ подтверждения: 2 для атаки, 3 для heal  │    │
+│  │  ├─ Routes (FastAPI)                            │    │
+│  │  │   ├─ POST /agent/report  — HMAC-приёмник     │    │
+│  │  │   ├─ GET  /data          — JSON для UI       │    │
+│  │  │   ├─ GET  /details/:uuid — подробности ноды  │    │
+│  │  │   └─ POST /agent/nodes   — установка агента  │    │
+│  │  ├─ Notify                                      │    │
+│  │  │   ├─ Telegram-бот (alerter)                  │    │
+│  │  │   └─ Panel (in-app уведомления)              │    │
+│  │  └─ Module — JS-виджет в UI панели              │    │
+│  └─────────────────────────────────────────────────┘    │
 │                                                         │
-│  ┌──────────┐    ┌──────────┐    ┌───────────────────┐  │
-│  │  Poller   │───▶│ Classify │───▶│ notify / tg_bot   │  │
-│  │ (тик 20с) │    │ (пороги) │    │ (TG / panel_push) │  │
-│  └────┬─────┘    └──────────┘    └───────────────────┘  │
-│       │                                                  │
-│       ▼                                                  │
-│  ┌──────────────────────┐    ┌─────────────────────┐    │
-│  │ PostgreSQL (панель)   │    │   Plugin API v1      │    │
-│  │                       │    │                      │    │
-│  │ node_metrics_snapshots│    │ /data  /attacks      │    │
-│  │ ddos_monitoring_*     │    │ /details /settings   │    │
-│  └──────────────────────┘    │ /agent/report        │    │
-│                               └──────────┬───────────┘    │
-│                                          │                │
-└──────────────────────────────────────────┼────────────────┘
-                                           │
-                    ┌──────────────────────┼──────────┐
-                    │  ddos-agent (нода)    │          │
-                    │                       │          │
-                    │  /proc → collect() ───┘          │
-                    │  HMAC-SHA256                      │
-                    │  systemd service                  │
-                    └──────────────────────────────────┘
+│  ┌─────────────────────────────────────────────────┐    │
+│  │ ddos-agent (на каждой ноде)                     │    │
+│  │  ├─ /proc/net/snmp (TCP SYN_RECV)               │    │
+│  │  ├─ /proc/net/dev (rx/tx bytes, drops)          │    │
+│  │  ├─ /proc/net/sockstat (mem, orphan, tw)        │    │
+│  │  ├─ /proc/sys/net/netfilter/nf_conntrack_*      │    │
+│  │  ├─ systemd failed-units                        │    │
+│  │  ├─ load average, CPU, RAM, disk, swap          │    │
+│  │  └─ per-protocol: TCP/UDP/ICMP bytes + pps      │    │
+│  └─────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────┘
 ```
 
-## Компоненты
+### Ключевые возможности
 
-| Модуль | Строк | Назначение |
+| Возможность | Описание |
+|---|---|
+| **Baseline mode** | Автоматически learns нормальный трафик за 7 дней (p95×3). Пороги адаптируются к реальной нагрузке каждой ноды |
+| **Per-protocol thresholds** | TCP/UDP/ICMP — отдельные пороги по Мбит/с и pps (стиль fastnetmon) |
+| **SYN-rate detector** | Ловит медленный SYN-флуд по скорости роста `syn_recv/сек`, даже если абсолютное значение мало |
+| **TTL closure** | Висящие атаки автоматически закрываются через настраиваемый TTL (по умолчанию выкл) |
+| **State restore** | После рестарта панели — восстановление активных атак из БД (без «все зелёные») |
+| **VPN-фильтр** | Легальные VPN-клиенты не триггерят атаку (опционально) |
+| **Agent install** | Автоматическая установка ddos-agent на ноды через `exec_script` панели |
+| **Precheck** | Проверка готовности ноды (agent_token, WebSocket) перед установкой агента |
+
+### Детект атак
+
+**Источник 1: панель** (`node_metrics_snapshots`)
+
+| Порог | Значение по умолчанию | Описание |
 |---|---|---|
-| `__init__.py` | 83 | Точка входа плагина: манифест, scheduled tasks, PluginParts |
-| `poller.py` | 975 | Poller: чтение телеметрии из БД, классификация атак, lifecycle атак |
-| `data.py` | 472 | Схема БД (DDL, идемпотентный), запросы: ноды, атаки, события, топ IP |
-| `routes.py` | 161 | FastAPI-роуты: `/data`, `/attacks`, `/details`, `/settings`, `/agent/report` |
-| `agent_receiver.py` | 191 | Приёмник срезов агента: HMAC-валидация, replay-защита, запись в БД |
-| `agent_routes.py` | 164 | Роуты управления агентами: установка, статус, UI-секция |
-| `agent_installer.py` | 326 | Сборка bash-скрипта установки агента (systemd unit + python-файл) |
-| `notify.py` | 262 | Алёртинг: форматирование сообщений, отправка через TG-бот или panel_notify |
-| `tg_bot.py` | 92 | Telegram Bot API: sendMessage, fallback на panel_notify панели |
-| `module.py` | 513 | UI-модуль: JS для админки (window.rwaPluginUI), таблица нод и атак |
-| `page.py` | 51 | Standalone HTML для панелей < 4.5.4 (без generic-маршрута) |
-| `secret.py` | 68 | Lifecycle HMAC-секрета: генерация, миграция, per-context lock |
-
-## ddos-agent
-
-Лёгкий сборщик метрик на ноде. **Ноль зависимостей** — только stdlib Python.
-
-**Собирает:**
-- CPU (дельта `/proc/stat`), RAM, Swap, диск
-- Сетевая статистика: RX/TX bps/pps, дропы (дельта `/proc/net/dev`)
-- TCP-соединения: SYN_RECV, ESTABLISHED, per-IP (парсинг `/proc/net/tcp[6]`)
-- conntrack (count/max)
-- Упавшие systemd-юниты
-
-**Отправляет:**
-- POST на панель: `/api/v2/plugins/ddos-monitoring/agent/report`
-- HMAC-SHA256 подпись: `HMAC(secret, "{node_uuid}|{ts}|{metrics_json}")`
-- Интервал: настраивается (по умолчанию 15 сек)
-
-**Безопасность:**
-- Секрет хранится в `/etc/ddos-monitoring/agent-secret` (chmod 600)
-- Replay-защита: окно свежести 120 сек
-- Per-node секреты (генерируются при установке)
-
-## Детект атак
-
-Классификатор (`poller.py::classify`) анализирует каждый срез метрик:
-
-### Пороги (по умолчанию)
-
-| Метрика | Порог | Описание |
-|---|---|---|
-| `rx_bps` | 500 Мбит/с | Входящий трафик |
-| `rx_pps` | 100 000 пак/с | Входящие пакеты |
-| `syncookies_ps` | 1 000 | SYN cookies в секунду |
-| `listen_drop_ps` | 500 | Дропы очереди listen |
+| `rx_bps` | 200 Мбит/с | Входящий трафик |
+| `rx_pps` | 30k pps | Пакеты в секунду |
+| `syncookies_ps` | 200/с | SYN cookies |
+| `listen_drop_ps` | 100/с | Listen drops |
 | `conntrack_ratio` | 75% | Заполненность conntrack |
-| `cpu_percent` | 95% | CPU |
-| `memory_percent` | 95% | RAM |
-| `load_per_cpu` | 3.0 | Load Average на ядро |
-| `disk_percent` | 90% | Диск |
+| `cpu_percent` | 90% | CPU |
+| `memory_percent` | 90% | RAM |
+| `load_per_cpu` | 2.0 | Load average |
+| `disk_percent` | 85% | Диск |
 
-### Типы атак
+**Источник 2: ddos-agent** (полные метрики)
 
-| Тип | Детект |
-|---|---|
-| TCP SYN-флуд | syncookies ≥ 50% порога и ≥ listen_drop |
-| conntrack-исчерпание | conntrack_ratio ≥ 90% |
-| TCP-флуд (переполнение очереди) | listen_drop ≥ порога |
-| Пакетный флуд | rx_pps превышает порог |
-| Объёмный флуд | rx_bps превышает порог |
+| Порог | Значение | Описание |
+|---|---|---|
+| `tcp_mbps` / `udp_mbps` / `icmp_mbps` | 100 Мбит/с | Per-protocol bandwidth |
+| `tcp_pps` / `udp_pps` / `icmp_pps` | 100k pps | Per-protocol pps |
+| `syn_recv` | 1000 | SYN_RECV в очереди |
+| `syn_rate` | 50/сек | Рост SYN_RECV (медленный флуд) |
 
-### Severity
+**Типы атак:** TCP SYN-флуд, conntrack-исчерпание, TCP-флуд (переполнение очереди), пакетный флуд, объёмный флуд, per-protocol (UDP/ICMP flood)
 
-| Уровень | Условие |
-|---|---|
-| **critical** | peak_ratio ≥ 3.0 или conntrack ≥ 95% |
-| **high** | peak_ratio ≥ 1.5 |
-| **medium** | все остальные |
+**Severity:** `critical` (3× порога или conntrack ≥95%) → `high` (1.5×) → `medium`
 
-### Lifecycle
+**Lifecycle:** подтверждение 2 тика для атаки, 3 тика для recovery. Cooldown 5 мин между алертами.
 
-```
-Норма → [2 подтверждения] → АТАКА → [3 подтверждения] → Норма
-                              │
-                              ├── load (CPU/RAM/disk)
-                              ├── health (ошибки сети)
-                              └── offline (нет данных > 120с)
-```
+### Baseline mode
 
-## UI
+Вместо статических порогов — автоматическая калибровка по реальному трафику:
 
-Встроенный дашборд в админке панели:
-
-- **Таблица нод** — имя, версия агента, статус, активная атака, тип
-- **Последние атаки** — нода, начало, конец, тип, severity
-- **Расшифровка по нодам** — вердикт (атака/стабильно/нагрузка/нет связи), метрики среза, топ IP
-- **Кнопка «Обновить»** — ручной рефреш без ожидания poller
-- **Настройки** — пороги, TG-бот (токен + chat_id), base URL для агента
-
-Поддержка тем: тёмная и светлая (CSS-переменные панели).
-
-## Telegram-алерты
-
-Сообщения с эмодзи-статусами, московским временем, метриками:
+1. Каждый час poller пересчитывает **p95** за последние 7 дней
+2. Порог = `p95 × expression` (по умолчанию `value * 3`)
+3. Минимальные пороги защищают от слишком низких baseline на тихих нодах
+4. Включается через `plugin_settings.baseline_enabled = true`
 
 ```
-🚨 DDoS-атака обнаружена
-──────────────────────
-🖥 Нода: fr1
-📡 Источник: ddos-agent
-⏰ 11.09.2026 14:32:15 МСК
-🔴 КРИТИЧЕСКИЙ
-
-Тип: TCP SYN-флуд
-Причины: SYN cookies, listen drop
-🎯 Target: node
-
-📥 RX: 850.0 Мбит/с · 125 000 пак/с
-📤 TX: 45.2 Мбит/с · 3 200 пак/с
-🔗 Соединения: SYN_RECV: 12450 · EST: 890
-👥 Уникальные IP: 3 · 192.168.1.1 (5000) [vpn], 10.0.0.1 (3200)
+Порог = max(p95_за_7_дней × 3, минимальный_порог)
 ```
 
-**Два режима:**
-1. **Свой бот** — токен и chat_id в настройках плагина, отправка через Bot API
-2. **Fallback** — через `panel_notify` панели (если бот не настроен)
-
-## Установка
+### Установка
 
 ```bash
-# Собрать wheel
-python -m build --wheel
+# 1. Клонировать в директорию плагинов панели
+git clone https://github.com/multi81/ddos-monitoring-remnawave-admin-panel.git \
+  /path/to/remnawave-admin/plugins/ddos-monitoring
 
-# Положить в директорию плагинов панели
-cp dist/ddos_monitoring-*.whl /app/plugins/
+# 2. Установить зависимости
+cd /path/to/remnawave-admin/plugins/ddos-monitoring
+pip install -e .
 
-# Перезапустить панель
-systemctl restart remnawave-admin
+# 3. Перезапустить панель — плагин зарегистрируется автоматически
 ```
-
-Агент на ноды ставится из UI панели (кнопка «Установить агент») через `exec_script` канала нод.
 
 ### Настройка
 
-В админке панели → Настройки плагина:
+**plugin_settings** (создаются автоматически при первом запуске):
 
-| Ключ | Описание | По умолчанию |
+| Ключ | Значение по умолчанию | Описание |
 |---|---|---|
-| `thresholds` | JSON с порогами (см. таблицу выше) | встроенные |
-| `tg_bot_token` | Токен Telegram-бота | — |
-| `tg_chat_ids` | Chat ID через запятую | — |
-| `agent_report_base_url` | URL панели для агентов (auto-detect если пусто) | — |
+| `thresholds` | `{}` | Кастомные пороги (перекрывают defaults) |
+| `baseline_enabled` | `false` | Включить baseline mode |
+| `exclude_vpn` | `false` | Исключить VPN-клиенты из детекта |
+| `alert_cooldown_s` | `300` | Cooldown между алертами (сек) |
+| `attack_stale_ttl_s` | `0` | TTL для зависших атак (0 = выкл) |
 
-## Права (RBAC)
+### ddos-agent
 
-| Ресурс | Permission | Описание |
-|---|---|---|
-| `ddos` | `view` | Дашборд: атаки, нагрузка, ноды |
-| `ddos` | `view_ips` | IP атакующих (приватные данные) |
-| `ddos` | `manage` | Установка/переустановка агента на нодах |
+Устанавливается на ноды через панель (POST `/agent/nodes`). Сбор метрик:
 
-## Тесты
+- `/proc/net/snmp` — TCP SYN_RECV, established, time-wait
+- `/proc/net/dev` — rx/tx bytes, packets, drops
+- `/proc/net/sockstat` — mem, orphan, timewait
+- `/proc/sys/net/netfilter/` — conntrack count/max
+- `systemctl list-units --failed` — упавшие юниты
+- `/proc/loadavg`, `/proc/stat`, `/proc/meminfo` — CPU, RAM, load, swap
+- Per-protocol: TCP/UDP/ICMP bytes + pps (из `/proc/net/snmp` + XDP)
 
-123 теста, самодостаточные (фейковый ctx/db, реальная БД не нужна):
+### Авторизация
 
-```bash
-python -m venv .venv && .venv/bin/pip install pytest pytest-asyncio fastapi build
-.venv/bin/python -m pytest tests/ -q
+| Метод | Описание |
+|---|---|
+| **HMAC-SHA256** | Агент → панель. Секрет хранится в `plugin_settings` (auto-init). Replay-защита: ±120с по timestamp |
+| **RBAC** | Два права: `ddos:view` (атаки и нагрузка), `ddos:view_ips` (IP атакующих) |
+| **Agent precheck** | Перед установкой агента: проверка `agent_token` и WebSocket-соединения |
+
+### API Endpoints
+
+| Метод | Путь | Описание | Авторизация |
+|---|---|---|---|
+| `POST` | `/agent/report` | Приём среза от агента | HMAC |
+| `GET` | `/data` | Состояние флота + активные атаки | `ddos:view` |
+| `GET` | `/details/:uuid` | Детали по ноде (метрики, атаки, топ IP) | `ddos:view` |
+| `GET` | `/summary` | Текстовое саммари (для TG-бота) | `ddos:view` |
+| `POST` | `/settings` | Обновить настройки плагина | admin |
+| `POST` | `/baseline/recompute` | Принудительный пересчёт baseline | admin |
+| `POST` | `/agent/nodes` | Установить агента на ноды | admin |
+| `GET` | `/agent/status` | Статус агентов (версия, свежесть) | `ddos:view` |
+| `GET` | `/settings` | Текущие настройки | `ddos:view` |
+| `GET` | `/events` | Последние события | `ddos:view` |
+
+### Зависимости
+
+```
+fastapi
+asyncpg
 ```
 
-**Покрытие:**
-- Классификация атак (все типы + edge cases)
-- Poller: lifecycle атак, подтверждения, recovery, stale
-- Agent receiver: HMAC, replay-защита, bad payloads
-- Routes: RBAC, data/attacks/details endpoints
-- Telegram: отправка, форматирование, fallback
-- Схема: идемпотентный DDL, миграции
-- Интеграционные: полный цикл атака→алерт→recovery
+### Тесты
 
-## Статус
+```bash
+pip install -e ".[test]"
+pytest tests/ -v
+```
 
-- ✅ **Фаза 1** — скелет, poller (tick-lock, backoff), идемпотентная схема, routes с RBAC, UI-модуль
-- ✅ **Фаза 2** — TG-алерты, агент (сборка/установка/статус), классификация (все типы атак), lifecycle атак с подтверждениями
-- ⏳ **Фаза 3** — SVG-схема флота, расширенная аналитика
+161 тестов покрывают: classify, baseline, poller lifecycle, agent receiver, routes RBAC, notify, schema, agent install precheck, SYN-rate, offline attack close, per-protocol thresholds, state restore, name fallback race, CPU% baseline.
 
-## Известные ограничения
+### Статус
 
-- **Multi-worker:** состояние poller'а в памяти. При >1 uvicorn worker — дубли в БД. Решение: UNIQUE-констрейнт «одна открытая атака на ноду» + лидер-выбор (фаза 2+).
-- **Рестарт mid-attack:** открытые атаки закрываются по таймауту на следующем тике.
+**v0.7.48** — production-ready. Активно используется.
 
-## Зависимости
+---
 
-- Python ≥ 3.11
-- `aiohttp` ≥ 3.9 (для Telegram Bot API)
-- remnawave-admin ≥ 4.5.4 (Plugin API v1, полный UI)
+## English
 
-## Лицензия
+### What
 
-MIT
+A plugin for [remnawave-admin](https://github.com/Case211/remnawave-admin) (Plugin API v1) that monitors nodes for DDoS attacks and system health issues. Data comes from **ddos-agent** installed on each node via the panel's WebSocket channel.
+
+### Key Features
+
+- **Baseline mode** — auto-calibrates thresholds from 7-day p95 traffic patterns
+- **Per-protocol thresholds** — TCP/UDP/ICMP separate thresholds (fastnetmon-style)
+- **SYN-rate detector** — catches slow SYN floods by growth rate
+- **TTL closure** — auto-close stale attacks after configurable TTL
+- **State restore** — survives panel restarts without losing active attacks
+- **VPN filtering** — legal VPN clients excluded from attack detection
+- **Agent auto-install** — deploy ddos-agent to nodes via panel's `exec_script`
+- **Precheck** — verifies node readiness (agent_token, WebSocket) before install
+
+### Quick Start
+
+```bash
+git clone https://github.com/multi81/ddos-monitoring-remnawave-admin-panel.git \
+  /path/to/remnawave-admin/plugins/ddos-monitoring
+cd /path/to/remnawave-admin/plugins/ddos-monitoring
+pip install -e .
+# Restart panel — plugin registers automatically
+```
+
+### Tests
+
+```bash
+pip install -e ".[test]"
+pytest tests/ -v  # 161 tests
+```
+
+### Status
+
+**v0.7.48** — production-ready. Actively maintained.
