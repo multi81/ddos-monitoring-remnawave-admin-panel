@@ -31,20 +31,26 @@ ALERT_COOLDOWN_S = 300.0
 # Срез телеметрии считается свежим не дольше этого срока; дальше — stale.
 STALE_AFTER_S = 120.0
 
-# Пороги по умолчанию (перенос Thresholds из ddos-monitoring-monitor). Значения
-# из настроек плагина (plugin_settings, ключ thresholds) перекрывают их.
+# Пороги по умолчанию пересмотрены в v0.7.44 (на основе fastnetmon defaults):
+#   - threshold_pps=20_000 (fastnetmon docs)
+#   - threshold_mbps=1_000 (fastnetmon docs)
+# Старые значения (500 Mbps / 100k pps) слишком грубые для VPS с 100Mbps-
+# 1Gbit каналом. Эти дефолты дают разумный баланс: ловят заметные атаки,
+# но не спамят алертами на легитимном трафике. Перекрываются через
+# plugin_settings.thresholds.
 DEFAULT_THRESHOLDS: dict[str, float] = {
-    "rx_bps": 500_000_000.0,        # 500 Мбит/с входящий
-    "rx_pps": 100_000.0,
-    "syncookies_ps": 1_000.0,
-    "listen_drop_ps": 500.0,
+    "rx_bps": 200_000_000.0,        # 200 Мбит/с входящий (было 500)
+    "rx_pps": 30_000.0,             # 30k pps (было 100k)
+    "syncookies_ps": 200.0,         # SYN cookies (было 1000)
+    "listen_drop_ps": 100.0,        # listen drops (было 500)
     "conntrack_ratio": 0.75,
-    "rx_drop_ps": 100.0,
-    # Фаза 2 (перенос Thresholds легаси-монитора)
-    "cpu_percent": 95.0,
-    "memory_percent": 95.0,
-    "load_per_cpu": 3.0,
-    "disk_percent": 90.0,
+    "rx_drop_ps": 50.0,             # (было 100)
+    # Фаза 2 (перенос Thresholds легаси-монитора) — снижены для раннего
+    # детекта на VPS-каналах.
+    "cpu_percent": 90.0,            # (было 95)
+    "memory_percent": 90.0,         # (было 95)
+    "load_per_cpu": 2.0,            # (было 3)
+    "disk_percent": 85.0,           # (было 90)
 }
 
 
@@ -520,6 +526,10 @@ class DdosPoller:
 
         # Имена нод — из панели (для /data); uuid → name (M-1).
         # get_nodes() отдаёт {"response": [...]}; терпим и list на всякий случай.
+        # Fallback на прямой SQL к public.nodes — ядро Remnawave /api/nodes
+        # иногда возвращает не все ноды (особенность фильтрации по raw_data),
+        # и без fallback'а Hermes (9167ddba-...) остаётся в ddos_monitoring_node_state
+        # с node_name=NULL.
         node_names: dict[str, str] = {}
         try:
             nodes_raw = await self._fetch(api.get_nodes(skip_cache=True))
@@ -532,6 +542,32 @@ class DdosPoller:
                     node_names[str(n["uuid"])] = str(n.get("name") or "")
         except Exception:  # noqa: BLE001 — имена косметика, срезу не мешают
             log.warning("ddos-monitoring: get_nodes failed — node names unavailable")
+
+        # Fallback: имена ВСЕХ нод из public.nodes (даже если их имя уже
+        # есть в node_state). Раньше fallback срабатывал только когда имя
+        # было пустым — это приводило к race: после ручного UPDATE имя
+        # заполнялось, но следующий tick видел непустое имя и пропускал
+        # fallback, а panel_api не возвращал ноду → record_sample снова
+        # писал пусто. Теперь ищем имена для ВСЕХ uuid'ов которых нет
+        # в panel_api (т.е. которых не видели в этот тик).
+        try:
+            _state_rows = await self._fetch(ctx.db.fetch(
+                "SELECT node_uuid::text FROM ddos_monitoring_node_state"))
+            _missing = [str(r["node_uuid"]) for r in _state_rows
+                        if str(r["node_uuid"]) not in node_names]
+            if _missing:
+                _name_rows = await self._fetch(ctx.db.fetch(
+                    "SELECT uuid::text, name FROM public.nodes "
+                    "WHERE uuid = ANY($1::uuid[])", _missing))
+                for r in _name_rows:
+                    uuid = str(r["uuid"])
+                    nm = str(r["name"] or "")
+                    if nm:
+                        node_names[uuid] = nm
+                        log.info("ddos-monitoring: node %s name from SQL: %s",
+                                 uuid, nm)
+        except Exception as _e:  # noqa: BLE001
+            log.warning("ddos-monitoring: SQL name fallback failed: %s", _e)
 
         # Свежий срез каждой ноды: последний snapshot за окно
         rows = await self._fetch(ctx.db.fetch(

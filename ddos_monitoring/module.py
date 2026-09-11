@@ -118,9 +118,25 @@ MODULE_JS = r"""
   function loadDetails(root) {
     var slot = root.querySelector('#ddos-details-slot');
     if (!slot) return;
+    // Запоминаем какие <details> открыты (по data-duuid), чтобы
+    // восстановить состояние после пересоздания DOM в renderDetails().
+    var openSet = {};
+    var prevDuuids = slot.querySelectorAll('details[data-duuid]');
+    for (var i = 0; i < prevDuuids.length; i++) {
+      openSet[prevDuuids[i].getAttribute('data-duuid')] = prevDuuids[i].open;
+    }
     fetch(API_BASE + '/details', { credentials: 'same-origin' })
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(function (d) { slot.innerHTML = renderDetails(d); detailsLoadedOnce = true; })
+      .then(function (d) {
+        slot.innerHTML = renderDetails(d);
+        // Восстанавливаем состояние <details> после пересоздания DOM.
+        var newDuuids = slot.querySelectorAll('details[data-duuid]');
+        for (var k = 0; k < newDuuids.length; k++) {
+          var du = newDuuids[k].getAttribute('data-duuid');
+          if (du in openSet) newDuuids[k].open = openSet[du];
+        }
+        detailsLoadedOnce = true;
+      })
       .catch(function () { slot.innerHTML = ''; });
     var ts = root.querySelector('#ddos-refresh-ts');
     if (ts) ts.textContent = 'обновлено ' + new Date().toLocaleTimeString();
@@ -306,8 +322,17 @@ MODULE_JS = r"""
             top_ips_n: parseInt((slot.querySelector('#ddos-agent-top-n') || {}).value, 10) || 10
           }).then(function (r) {
             console.log('[ddos] install done:', r);
-            status.textContent = '✅ установлено: ' + (r.installed || []).length +
-              (r.unknown && r.unknown.length ? ' · неизвестных: ' + r.unknown.length : '');
+            var msg = '✅ установлено: ' + (r.installed || []).length;
+            if (r.unknown && r.unknown.length) {
+              msg += ' · неизвестных: ' + r.unknown.length;
+            }
+            if (r.errors && Object.keys(r.errors).length) {
+              var errs = Object.keys(r.errors).map(function (uuid) {
+                return uuid.slice(0, 8) + ': ' + r.errors[uuid];
+              }).slice(0, 3).join('; ');
+              msg += ' · ошибок: ' + Object.keys(r.errors).length + ' (' + errs + ')';
+            }
+            status.textContent = msg;
             // перерисовать секцию, чтобы бейджи показали свежую версию агента
             setTimeout(function () {
               refreshAgentStatus()
