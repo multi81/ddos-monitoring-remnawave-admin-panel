@@ -798,12 +798,32 @@ async def active_ips_by_node(ctx) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for r in rows or []:
         node = (r.get("node_name") if hasattr(r, "get") else r["node_name"]) or "unknown"
-        top_ips = (r.get("top_ips") if hasattr(r, "get") else r["top_ips"]) or []
+        top_ips_raw = (r.get("top_ips") if hasattr(r, "get") else r["top_ips"]) or []
         unique_ips = int((r.get("unique_ips") if hasattr(r, "get") else r["unique_ips"]) or 0)
-        ips = []
-        seen: set = set()
-        for entry in top_ips:
-            ip = (entry.get("ip") if hasattr(entry, "get") else entry["ip"]) or ""
+        # asyncpg может вернуть jsonb как строку
+        if isinstance(top_ips_raw, str):
+            try:
+                top_ips_raw = json.loads(top_ips_raw)
+            except (json.JSONDecodeError, TypeError):
+                top_ips_raw = []
+        if not isinstance(top_ips_raw, list):
+            top_ips_raw = []
+        ips: list[str] = []
+        seen: set[str] = set()
+        for entry in top_ips_raw:
+            if isinstance(entry, str):
+                try:
+                    entry = json.loads(entry)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            ip = ""
+            if isinstance(entry, dict):
+                ip = str(entry.get("ip", ""))
+            elif hasattr(entry, "__getitem__"):
+                try:
+                    ip = str(entry["ip"])
+                except (KeyError, IndexError, TypeError):
+                    pass
             if ip and ip not in seen:
                 seen.add(ip)
                 ips.append(ip)
