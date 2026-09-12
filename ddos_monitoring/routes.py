@@ -39,6 +39,19 @@ def build_router(ctx):
         res = await AgentReceiver(ctx).handle(payload)
         return _json(res, status=200 if res.get("saved") else 400)
 
+    @router.get("/agent/config", summary="Агент: динамическая конфигурация (без сессии)",
+                include_in_schema=False)
+    async def agent_config():
+        """Публичный endpoint для агентов. Возвращает top_ips_n."""
+        try:
+            row = await ctx.db.fetchrow(
+                "SELECT value FROM plugin_settings WHERE key = 'top_ips_n'"
+            )
+            n = int(row["value"]) if row else 0
+        except Exception:
+            n = 0
+        return _json({"top_ips_n": n})
+
     @router.get("/data", summary="Флот: состояние нод, активные атаки, статус poller (ddos:view)")
     async def data_route(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
         state = POLLER.public_state()

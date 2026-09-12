@@ -4,7 +4,7 @@
 Установка — через exec_script канала агентов панели; скан — по маркеру версии.
 """
 
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 
 _AGENT_TEMPLATE = '''#!/usr/bin/env python3
 """ddos-agent {version} — лёгкий сборщик метрик ноды для DDoS-мониторинга панели.
@@ -24,7 +24,7 @@ INTERVAL_S = {interval}
 VERSION = "{version}"
 
 IP_LIMIT = {ip_limit}          # max соединений с одного IP (0 = выключено)
-TOP_IPS_N = {top_ips_n}        # сколько топ-источников слать
+TOP_IPS_N = {top_ips_n}        # 0 = все IP, >0 = топ-N
 
 
 def _read(path):
@@ -33,6 +33,28 @@ def _read(path):
             return f.read()
     except OSError:
         return ""
+
+
+_cfg_prev = 0
+
+
+def _fetch_config():
+    \"\"\"Подтянуть top_ips_n с панели (каждые ~5 мин).\"\"\"
+    global TOP_IPS_N, _cfg_prev
+    now = __import__("time").monotonic()
+    if now - _cfg_prev < 300:
+        return
+    _cfg_prev = now
+    try:
+        url = PANEL_URL.rstrip("/") + "/api/v2/plugins/ddos-monitoring/agent/config"
+        req = urllib.request.Request(url, headers={"User-Agent": "ddos-agent/%s" % VERSION})
+        resp = urllib.request.urlopen(req, timeout=5)
+        cfg = json.loads(resp.read())
+        n = int(cfg.get("top_ips_n", TOP_IPS_N))
+        if n >= 0:
+            TOP_IPS_N = n
+    except Exception:
+        pass
 
 
 def collect():
@@ -98,7 +120,7 @@ def collect():
     m["syn_recv"] = syn
     m["established"] = est
     m["unique_ips"] = len(uniq)
-    top = sorted(per_ip.items(), key=lambda kv: -kv[1])[:TOP_IPS_N]
+    top = sorted(per_ip.items(), key=lambda kv: -kv[1])[:TOP_IPS_N] if TOP_IPS_N > 0 else sorted(per_ip.items(), key=lambda kv: -kv[1])
     m["top_ips"] = [{"ip": _fmt_ip(k), "count": v} for k, v in top]
     if IP_LIMIT > 0:
         m["ip_limit_breaches"] = [
@@ -228,6 +250,7 @@ def report(metrics):
 def main():
     while True:
         try:
+            _fetch_config()
             m = collect()
             # CPU% считается по дельте /proc/stat между циклами.
             # Сначала сохранить baseline (total, idle), потом прочитать prev.
@@ -257,7 +280,7 @@ if __name__ == "__main__":
 
 def build_agent_file(panel_url: str, node_uuid: str,
                      interval: int = 15, ip_limit: int = 50,
-                     top_ips_n: int = 10) -> str:
+                     top_ips_n: int = 0) -> str:
     code = _AGENT_TEMPLATE
     code = code.replace("{version}", AGENT_VERSION)
     code = code.replace("{panel_url}", panel_url)
@@ -288,7 +311,7 @@ WantedBy=multi-user.target
 
 def build_install_script(panel_url: str, node_uuid: str,
                          interval: int = 15, ip_limit: int = 50,
-                         top_ips_n: int = 10) -> str:
+                         top_ips_n: int = 0) -> str:
     """Bash-скрипт для exec_script: идемпотентен, переустанавливает при смене параметров."""
     agent = build_agent_file(panel_url, node_uuid, interval, ip_limit, top_ips_n)
     unit = build_unit_file()
