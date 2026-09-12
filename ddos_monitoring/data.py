@@ -776,34 +776,37 @@ _log = logging.getLogger("ddos_monitoring.data")
 async def active_ips_by_node(ctx) -> list[dict[str, Any]]:
     """Уникальные активные IP, сгруппированные по нодам.
 
-    Источник — user_connections (disconnected_at IS NULL).
-    Возвращает [{node_name, ips: [ip, ...]}].
+    Источник — последний снапшот агента (ddos_monitoring_agent_snapshots.top_ips).
+    top_ips содержит топ-N IP (по умолчанию 10) — полный список только на ноде.
+    Возвращает [{node_name, ips: [ip, ...], unique_ips: int}].
     """
     try:
         rows = await ctx.db.fetch(
             """
-            SELECT COALESCE(n.name, 'unknown') AS node_name,
-                   host(uc.ip_address) AS ip
-            FROM user_connections uc
-            LEFT JOIN nodes n ON n.uuid = uc.node_uuid
-            WHERE uc.ip_address IS NOT NULL
-              AND uc.disconnected_at IS NULL
-            ORDER BY node_name, ip
+            SELECT DISTINCT ON (s.node_uuid)
+                   COALESCE(n.name, 'unknown') AS node_name,
+                   s.top_ips,
+                   s.unique_ips
+            FROM ddos_monitoring_agent_snapshots s
+            LEFT JOIN nodes n ON n.uuid = s.node_uuid
+            ORDER BY s.node_uuid, s.ts DESC
             """,
         )
     except Exception as exc:
         _log.debug("active_ips_by_node query failed: %s", exc)
         return []
-    by_node: dict[str, list[str]] = {}
-    seen: dict[str, set] = {}
+    out: list[dict[str, Any]] = []
     for r in rows or []:
         node = (r.get("node_name") if hasattr(r, "get") else r["node_name"]) or "unknown"
-        ip = (r.get("ip") if hasattr(r, "get") else r["ip"]) or ""
-        if ip:
-            if node not in seen:
-                seen[node] = set()
-                by_node[node] = []
-            if ip not in seen[node]:
-                seen[node].add(ip)
-                by_node[node].append(ip)
-    return [{"node_name": n, "ips": ips} for n, ips in sorted(by_node.items())]
+        top_ips = (r.get("top_ips") if hasattr(r, "get") else r["top_ips"]) or []
+        unique_ips = int((r.get("unique_ips") if hasattr(r, "get") else r["unique_ips"]) or 0)
+        ips = []
+        seen: set = set()
+        for entry in top_ips:
+            ip = (entry.get("ip") if hasattr(entry, "get") else entry["ip"]) or ""
+            if ip and ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+        out.append({"node_name": node, "ips": ips, "unique_ips": unique_ips})
+    out.sort(key=lambda x: x["node_name"])
+    return out

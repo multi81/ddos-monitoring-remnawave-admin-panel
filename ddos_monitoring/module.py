@@ -649,7 +649,8 @@ MODULE_JS = r"""
                 var lines = [];
                 var total = 0;
                 nodes.forEach(function (n) {
-                  lines.push('# ' + n.node_name);
+                  var label = n.node_name + (n.unique_ips ? ' (' + n.unique_ips + ' уникальных)' : '');
+                  lines.push('# ' + label);
                   n.ips.forEach(function (ip) { lines.push(ip); total++; });
                   lines.push('');
                 });
