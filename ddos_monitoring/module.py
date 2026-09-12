@@ -43,7 +43,8 @@ MODULE_JS = r"""
       expand: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>',
       bot: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="12" rx="3"/><path d="M12 4v4M9 14h6"/></svg>',
       zap: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h8l-1 8 10-12h-8l1-8Z"/></svg>',
-      trend: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 17 6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg>'
+      trend: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 17 6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg>',
+      download: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0-4-4m4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>'
     };
     return I[name] || '';
   }
@@ -563,7 +564,11 @@ MODULE_JS = r"""
   function renderDetails(d) {
     var nodes = (d && d.nodes) || [];
     var h = '<details class="ddos-details"><summary>' + icon('zap') +
-            ' Расшифровка по нодам</summary>';
+            ' Расшифровка по нодам ' +
+            '<button class="ddos-btn" id="ddos-download-ips" type="button" ' +
+            'style="margin-left:8px;padding:2px 8px;font-size:11px;" ' +
+            'title="Скачать список активных IP">' + icon('download') + ' IP</button>' +
+            '</summary>';
     if (!nodes.length) {
       h += '<div class="ddos-empty">Нет данных.</div></details>';
       return h;
@@ -629,6 +634,38 @@ MODULE_JS = r"""
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function (d) {
         slot.innerHTML = renderDetails(d);
+        // Bind download IPs button
+        var dlBtn = slot.querySelector('#ddos-download-ips');
+        if (dlBtn && !dlBtn._bound) {
+          dlBtn._bound = true;
+          dlBtn.addEventListener('click', function (e) {
+            e.preventDefault(); e.stopPropagation();
+            dlBtn.disabled = true; dlBtn.textContent = '…';
+            fetch(API_BASE + '/active-ips', { credentials: 'same-origin' })
+              .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+              .then(function (d) {
+                var nodes = d.nodes || [];
+                if (!nodes.length) { alert('Нет активных IP'); return; }
+                var lines = [];
+                var total = 0;
+                nodes.forEach(function (n) {
+                  lines.push('# ' + n.node_name);
+                  n.ips.forEach(function (ip) { lines.push(ip); total++; });
+                  lines.push('');
+                });
+                var blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+                var url = URL.createObjectURL(blob);
+                var a = document.createElement('a');
+                a.href = url;
+                a.download = 'active-ips-' + new Date().toISOString().slice(0, 10) + '.txt';
+                a.click();
+                setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+                dlBtn.textContent = '✓ ' + total;
+                setTimeout(function () { dlBtn.innerHTML = icon('download') + ' IP'; dlBtn.disabled = false; }, 2000);
+              })
+              .catch(function () { dlBtn.textContent = '✕ Ошибка'; setTimeout(function () { dlBtn.innerHTML = icon('download') + ' IP'; dlBtn.disabled = false; }, 2000); });
+          });
+        }
         var newDuuids = slot.querySelectorAll('details[data-duuid]');
         for (var k = 0; k < newDuuids.length; k++) {
           var du = newDuuids[k].getAttribute('data-duuid');

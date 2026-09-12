@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import time
 from typing import Any
 
@@ -767,3 +768,43 @@ async def poller_status(ctx) -> dict[str, Any]:
 
 def monotonic_ts() -> float:
     return time.monotonic()
+
+
+_log = logging.getLogger("ddos_monitoring.data")
+
+
+async def active_ips_by_node(ctx) -> list[dict[str, Any]]:
+    """Уникальные активные IP, сгруппированные по нодам.
+
+    Источник — user_connections (disconnected_at IS NULL).
+    Возвращает [{node_name, ips: [ip, ...]}].
+    """
+    try:
+        rows = await ctx.db.fetch(
+            """
+            SELECT n.name AS node_name,
+                   host(uc.ip_address::inet) AS ip
+            FROM user_connections uc
+            JOIN nodes n ON n.uuid = uc.node_uuid
+            WHERE uc.ip_address IS NOT NULL
+              AND uc.ip_address <> ''
+              AND uc.disconnected_at IS NULL
+            ORDER BY n.name, ip
+            """,
+        )
+    except Exception as exc:
+        _log.debug("active_ips_by_node query failed: %s", exc)
+        return []
+    by_node: dict[str, list[str]] = {}
+    seen: dict[str, set] = {}
+    for r in rows or []:
+        node = (r.get("node_name") if hasattr(r, "get") else r["node_name"]) or "unknown"
+        ip = (r.get("ip") if hasattr(r, "get") else r["ip"]) or ""
+        if ip:
+            if node not in seen:
+                seen[node] = set()
+                by_node[node] = []
+            if ip not in seen[node]:
+                seen[node].add(ip)
+                by_node[node].append(ip)
+    return [{"node_name": n, "ips": ips} for n, ips in sorted(by_node.items())]

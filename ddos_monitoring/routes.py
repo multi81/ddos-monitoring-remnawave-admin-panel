@@ -60,6 +60,11 @@ def build_router(ctx):
             out.append(d)
         return _json({"nodes": out})
 
+    @router.get("/active-ips", summary="Активные IP по нодам для скачивания (ddos:view)")
+    async def active_ips_route(_admin: AdminUser = Depends(require_permission("ddos", "view"))):
+        """GET /active-ips — уникальные активные IP, сгруппированные по нодам."""
+        return _json({"nodes": await data.active_ips_by_node(ctx)})
+
     @router.get("/history", summary="Drill-down: срезы метрик ноды за range (ddos:view)")
     async def history_route(
         node_uuid: str,
