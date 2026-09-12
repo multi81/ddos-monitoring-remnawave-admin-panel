@@ -645,7 +645,7 @@ MODULE_JS = r"""
               .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
               .then(function (d) {
                 var nodes = d.nodes || [];
-                if (!nodes.length) { alert('Нет активных IP'); return; }
+                if (!nodes.length) { dlBtn.textContent = '0 IP'; setTimeout(function () { dlBtn.innerHTML = icon('download') + ' IP'; dlBtn.disabled = false; }, 2000); return; }
                 var lines = [];
                 var total = 0;
                 nodes.forEach(function (n) {

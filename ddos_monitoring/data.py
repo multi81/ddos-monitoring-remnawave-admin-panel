@@ -782,14 +782,13 @@ async def active_ips_by_node(ctx) -> list[dict[str, Any]]:
     try:
         rows = await ctx.db.fetch(
             """
-            SELECT n.name AS node_name,
-                   host(uc.ip_address::inet) AS ip
+            SELECT COALESCE(n.name, 'unknown') AS node_name,
+                   host(uc.ip_address) AS ip
             FROM user_connections uc
-            JOIN nodes n ON n.uuid = uc.node_uuid
+            LEFT JOIN nodes n ON n.uuid = uc.node_uuid
             WHERE uc.ip_address IS NOT NULL
-              AND uc.ip_address <> ''
               AND uc.disconnected_at IS NULL
-            ORDER BY n.name, ip
+            ORDER BY node_name, ip
             """,
         )
     except Exception as exc:
