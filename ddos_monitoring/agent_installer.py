@@ -376,10 +376,15 @@ UNIT_EOF
 
 systemctl daemon-reload
 systemctl enable ddos-agent >/dev/null 2>&1 || true
+# Гарантированно убиваем старый процесс: на некоторых VPS cat > файл
+# оставляет старый inode, и systemd restart грузит старый бинарник
+# в память нового PID. stop+kill гарантирует чистый перезапуск.
 if systemctl is-active --quiet ddos-agent; then
-  systemctl restart ddos-agent
-else
-  systemctl start ddos-agent
+    systemctl stop ddos-agent
 fi
+# Прибиваем всех, кто ещё держит файл (на случай если stop завис)
+pkill -f '/usr/local/bin/ddos-agent' >/dev/null 2>&1 || true
+sleep 1
+systemctl start ddos-agent
 echo "installed {AGENT_VERSION}"
 """
