@@ -233,14 +233,27 @@ async def send_state_change(ctx, node_uuid: str, node_name: str, *,
 
 
 async def send_summary(ctx, rows: list[tuple]) -> None:
-    """rows: [(uuid, name, state, attack_type, reasons), ...]"""
+    """rows: [(uuid, name, state, attack_type, reasons), ...]
+
+    Используется и автоотчётом (poller._maybe_summary), и командой /update.
+    """
+    text = build_summary_text(rows)
+    title_line = text.split("\n", 1)[0]
+    body = text.split("\n", 1)[1] if "\n" in text else ""
+    await _send(ctx, title_line, body.split("\n") if body else [], "info")
+
+
+def build_summary_text(rows: list[tuple]) -> str:
+    """Чистая функция: рендер сводки в один HTML-блок для TG.
+
+    rows: [(uuid, name, state, attack_type, reasons), ...]
+    Используется и автоотчётом, и /update (чтобы можно было переслать в чат).
+    """
     counts: dict[str, int] = {}
     lines = ["🛡 <b>Состояние инфраструктуры</b>", f"🕒 {_msk_time()}", ""]
     for _uuid, name, state, attack_type, reasons in rows:
         name = escape(name)
         attack_type = escape(attack_type)
-        # Причины по легаси: только короткие имена («systemd», «Лимит IP»),
-        # без развёрнутых списков — детали уходят в алерты.
         short = [r for r in (reasons if isinstance(reasons, list) else [reasons or ""]) if r]
         reasons = escape(", ".join(short))
         counts[state] = counts.get(state, 0) + 1
@@ -259,4 +272,51 @@ async def send_summary(ctx, rows: list[tuple]) -> None:
               counts.get("load", 0), counts.get("health", 0),
               counts.get("offline", 0)))
     lines += ["", total]
-    await _send(ctx, lines[0], lines[1:], "info")
+    return "\n".join(lines)
+
+
+def build_node_status_text(node: dict, metrics: dict | None) -> str:
+    """Чистая функция: рендер статуса одной ноды для команды /node <имя>.
+
+    node: {"name": ..., "uuid": ..., "verdict": state, "attack_type": ..., "reasons": [...]}
+    metrics: последний срез метрик (или None).
+    """
+    name = escape(node.get("name") or node.get("uuid") or "?")
+    state = node.get("verdict") or "unknown"
+    if state == "attack":
+        head = f"🔴 <b>{name}</b> — атакуют"
+    elif state == "load":
+        head = f"🟠 <b>{name}</b> — высокая нагрузка"
+    elif state == "health":
+        head = f"🟡 <b>{name}</b> — требует внимания"
+    elif state == "offline" or state == "nodata":
+        head = f"⚫️ <b>{name}</b> — нет связи"
+    elif state == "stable":
+        head = f"🟢 <b>{name}</b> — стабильно"
+    else:
+        head = f"⚪ <b>{name}</b> — {escape(state)}"
+
+    lines = [head, f"🕒 {_msk_time()}"]
+    at = node.get("attack_type")
+    if at and state == "attack":
+        lines.append(f"💥 <b>Тип:</b> {escape(at)}")
+    reasons = node.get("reasons") or []
+    if reasons and state not in ("stable", "offline", "nodata"):
+        # короткие причины режем (как в саммари)
+        short = [r for r in reasons
+                 if r in ("systemd", "Лимит IP", "CPU", "RAM",
+                          "Load Average", "Диск", "Сеть", "Swap")]
+        if short:
+            lines.append(f"📌 <b>Сработало:</b> {escape(', '.join(short))}")
+    if metrics:
+        rx_mbps = metrics.get("net_rx_bps")
+        rx_pps = metrics.get("net_rx_pps")
+        ct = metrics.get("conntrack_count")
+        ct_max = metrics.get("conntrack_max")
+        if rx_mbps is not None:
+            lines.append(f"📥 RX: {_rate(rx_mbps)} Мбит/с · {_count(rx_pps)} pps")
+        if ct is not None and ct_max:
+            lines.append(f"🔗 Conntrack: {_count(ct)} / {_count(ct_max)}")
+        if metrics.get("source") == "agent":
+            lines.append("📡 Источник: ddos-agent")
+    return "\n".join(lines)

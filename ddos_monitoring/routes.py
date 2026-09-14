@@ -9,12 +9,69 @@ import hashlib
 import time
 import logging
 
+from .tg_bot import _chat_ids, _as_str  # единые helpers с tg_bot
+
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 _log = logging.getLogger("ddos_monitoring.routes")
 
 _NO_STORE = {"Cache-Control": "private, no-store", "Pragma": "no-cache"}
+
+
+def _hmac_eq(a: str, b: str) -> bool:
+    """constant-time сравнение (timing-safe)."""
+    return hmac.compare_digest((a or "").encode(), (b or "").encode())
+
+
+async def _handle_node_cmd(ctx, *, chat_id: int, arg: str) -> None:
+    """/node <имя_or_uuid> — статус конкретной ноды.
+
+    Поиск: точное совпадение по uuid, потом по name (case-insensitive prefix),
+    потом substring. Если нода не найдена — сообщение об ошибке.
+    """
+    from . import tg_bot, notify, poller
+    arg = (arg or "").strip()
+    if not arg:
+        await tg_bot.send(
+            ctx,
+            "❓ <b>/node</b> — укажи имя или uuid ноды.\n"
+            "Например: <code>/node Fi3_TiHost_TG</code>",
+            severity="info", chat_id=chat_id,
+        )
+        return
+    poller_inst = getattr(poller, "POLLER", None)
+    nodes = getattr(poller_inst, "_nodes", {}) or {}
+    # 1) uuid
+    found = nodes.get(arg)
+    arg_lower = arg.lower()
+    node_uuid = arg if found is not None else None
+    # 2) name case-insensitive
+    if not found:
+        for uuid, n in nodes.items():
+            if (n.get("name") or "").lower() == arg_lower:
+                found, node_uuid = n, uuid
+                break
+    # 3) substring по name
+    if not found:
+        for uuid, n in nodes.items():
+            if arg_lower in (n.get("name") or "").lower():
+                found, node_uuid = n, uuid
+                break
+    if not found:
+        await tg_bot.send(
+            ctx,
+            f"❌ Нода <b>{tg_bot.escape(arg)}</b> не найдена. "
+            "Проверь имя или uuid.",
+            severity="warning", chat_id=chat_id,
+        )
+        return
+    # copy-on-read: не мутируем poller._nodes
+    found = {**found, "uuid": found.get("uuid") or node_uuid or arg}
+    # последний срез метрик (если есть)
+    metrics = found.get("metrics") or {}
+    body = notify.build_node_status_text(found, metrics)
+    await tg_bot.send(ctx, body, severity="info", chat_id=chat_id)
 
 
 def _json(payload: dict, status: int = 200) -> JSONResponse:
@@ -225,6 +282,63 @@ def build_router(ctx):
             tg_bot._bot_api = real_api
         via = "panel" if state["sent"] == 0 and ctx.panel_calls else "bot"
         return _json({"sent": state["sent"], "via": via})
+
+    @router.post("/tg/webhook", summary="Telegram webhook для бота плагина (без сессии)",
+                 include_in_schema=False)
+    async def tg_webhook(request: Request, payload: dict = Body(default=None)):
+        """Принимает update от Telegram и обрабатывает команды /update, /node.
+
+        Авторизация — через X-Telegram-Bot-Api-Secret-Token (если задан в
+        plugin_settings.tg_webhook_secret). Если секрет не задан — принимаем
+        update от любого Telegram-сервера (URL знает только владелец бота).
+
+        Команды:
+          /update         — то же, что и автоотчёт (send_summary), ответ в чат
+          /node <имя|uuid> — статус конкретной ноды
+          /help           — список команд
+        """
+        from . import tg_bot, notify
+        payload = payload or {}
+        # 1) Верификация webhook по X-Telegram-Bot-Api-Secret-Token
+        secret = _as_str(await ctx.settings.get("tg_webhook_secret"))
+        sent_token = request.headers.get("x-telegram-bot-api-secret-token", "")
+        if secret and not _hmac_eq(sent_token, secret):
+            return _json({"error": "bad_webhook_secret"}, status=403)
+        # 2) Извлекаем сообщение
+        msg = (payload.get("message") or payload.get("edited_message") or {})
+        text = (msg.get("text") or "").strip()
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        if not text or chat_id is None:
+            return _json({"ok": True})  # не наша команда
+        # 3) Anti-abuse: разрешены только настроенные chat_ids
+        allowed = set(_chat_ids(_as_str(await ctx.settings.get("tg_chat_ids"))))
+        if allowed and chat_id not in allowed:
+            _log.warning("ddos-monitoring: tg_webhook from unknown chat %s", chat_id)
+            return _json({"ok": True})  # молча игнорим (не раскрываем факт)
+        # 4) Маршрутизация команд
+        if text == "/update" or text.startswith("/update ") or text.startswith("/update@"):
+            try:
+                rows = await POLLER._summary_rows(ctx)
+            except Exception:  # noqa: BLE001
+                _log.warning("ddos-monitoring: tg_webhook /update rows failed", exc_info=True)
+                rows = []
+            body = notify.build_summary_text(rows)
+            await tg_bot.send(ctx, body, severity="info", chat_id=int(chat_id))
+        elif text == "/node" or text.startswith("/node ") or text.startswith("/node@"):
+            parts = text.split(maxsplit=1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            await _handle_node_cmd(ctx, chat_id=int(chat_id), arg=arg)
+        elif text == "/help" or text.startswith("/help ") or text.startswith("/help@"):
+            await tg_bot.send(
+                ctx,
+                "🛡 <b>DDoS-мониторинг — команды</b>\n\n"
+                "/update — сводка по всем нодам (как автоотчёт)\n"
+                "/node <имя или uuid> — статус конкретной ноды\n"
+                "/help — это сообщение",
+                severity="info", chat_id=int(chat_id),
+            )
+        return _json({"ok": True})
 
     @router.get("/ui", summary="Standalone-страница (панели <4.5.4, без generic-маршрута, ddos:view)")
     async def ui_page(_admin: AdminUser = Depends(require_permission("ddos", "view"))):

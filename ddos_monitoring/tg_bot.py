@@ -49,11 +49,15 @@ def _as_str(raw: typing.Any) -> str:
     return s.strip()
 
 
-async def send(ctx, text: str, severity: str = "info") -> None:
-    """Отправка через свой бот (если настроен), иначе fallback panel_notify."""
+async def send(ctx, text: str, severity: str = "info",
+               chat_id: int | None = None) -> None:
+    """Отправка через свой бот (если настроен), иначе fallback panel_notify.
+
+    chat_id: если задан — отправляем ТОЛЬКО в этот чат (для ответов на команды);
+    иначе — рассылка по всем chat_ids из settings.
+    """
     token = _as_str(await ctx.settings.get("tg_bot_token"))
-    chats = _chat_ids(_as_str(await ctx.settings.get("tg_chat_ids")))
-    if not token or not chats:
+    if not token:
         panel_notify = getattr(ctx, "panel_notify", None)
         if not callable(panel_notify):
             logger.warning("ddos-monitoring: panel_notify unavailable; notification skipped")
@@ -64,21 +68,25 @@ async def send(ctx, text: str, severity: str = "info") -> None:
         except Exception:  # noqa: BLE001
             logger.warning("ddos-monitoring: panel_notify failed", exc_info=True)
         return
+    chats = _chat_ids(_as_str(await ctx.settings.get("tg_chat_ids")))
+    targets = [chat_id] if chat_id is not None else chats
+    if not targets:
+        logger.warning("ddos-monitoring: tg send_to_chat(%s) skipped — no chat_ids", chat_id)
+        return
     payload_base = {
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    for chat_id in chats:
+    for cid in targets:
         try:
             data = await _bot_api(token, "sendMessage",
-                                  {**payload_base, "chat_id": chat_id})
+                                  {**payload_base, "chat_id": cid})
             if not data.get("ok"):
                 logger.warning("ddos-monitoring: tg send to %s failed: %s",
-                               chat_id, json.dumps(data)[:200])
+                               cid, json.dumps(data)[:200])
         except Exception:  # noqa: BLE001 — алерт не роняет тик
-            logger.warning("ddos-monitoring: tg send failed for %s",
-                           chat_id, exc_info=True)
+            logger.warning("ddos-monitoring: tg send failed for %s", cid, exc_info=True)
 
 
 def mask_token(token: str) -> str:

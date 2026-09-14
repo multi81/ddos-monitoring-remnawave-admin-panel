@@ -95,7 +95,7 @@ def test_every_route_declares_permission(monkeypatch):
 
     # Список публичных endpoint'ов — авторизация через HMAC (см. agent_receiver.py).
     # Эти намеренно БЕЗ require_permission().
-    PUBLIC_PATHS = {"/agent/report", "/agent/config"}
+    PUBLIC_PATHS = {"/agent/report", "/agent/config", "/tg/webhook"}
 
     for path, fn, _summary in router.routes:
         if path in PUBLIC_PATHS:
