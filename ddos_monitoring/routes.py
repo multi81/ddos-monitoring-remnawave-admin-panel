@@ -3,16 +3,15 @@
 ddos:view — атаки и нагрузка; ddos:view_ips — IP атакующих (фаза 2+).
 JSON — с no-store, через jsonable_encoder.
 """
-from __future__ import annotations
 
 import hmac
 import hashlib
 import time
+import logging
 
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
-import logging
 _log = logging.getLogger("ddos_monitoring.routes")
 
 _NO_STORE = {"Cache-Control": "private, no-store", "Pragma": "no-cache"}
