@@ -304,16 +304,17 @@ def _json_list(value: list | tuple | None) -> str:
 # ── чтение для /data ─────────────────────────────────────────────
 
 async def total_nodes_in_panel(ctx) -> int:
-    """Полное число нод, которые знает панель (Remnawave `public.nodes`).
+    """Число активных нод в панели (Remnawave `public.nodes` где is_disabled=false).
 
     Не путать с `fleet_overview()` — здесь ноды со срезами от агентов
-    (онлайн); здесь — все ноды в панели (включая те, что без агента).
+    (онлайн); здесь — все активные ноды в панели (включая те, что без агента).
 
-    Используется UI KPI «Под наблюдением: N / M» (задача handoff.md #5).
+    Используется UI KPI «Под наблюдением: N / M».
+    Отключённые ноды исключены, чтобы не завышать M.
     """
     db = getattr(ctx, "db", ctx)
     row = await db.fetchval(
-        "SELECT COUNT(*)::int FROM public.nodes"
+        "SELECT COUNT(*)::int FROM public.nodes WHERE is_disabled = false"
     )
     return int(row or 0)
 
@@ -442,15 +443,21 @@ async def set_node_order(ctx, order: list[dict]) -> None:
     """Обновить sort_order для списка нод.
 
     order: [{"node_uuid": "...", "sort_order": 0}, ...]
+    Батч UPDATE через UNNEST — один round-trip вместо N.
     """
-    for item in order:
-        await ctx.db.execute(
-            """UPDATE ddos_monitoring_node_state
-               SET sort_order = $1, updated_at = NOW()
-               WHERE node_uuid = $2::uuid""",
-            int(item["sort_order"]),
-            str(item["node_uuid"]),
-        )
+    if not order:
+        return
+    uuids = [str(item["node_uuid"]) for item in order]
+    orders = [int(item["sort_order"]) for item in order]
+    await ctx.db.execute(
+        """UPDATE ddos_monitoring_node_state AS ns
+           SET sort_order = data.sort_order,
+               updated_at = NOW()
+           FROM (SELECT * FROM UNNEST($1::uuid[], $2::int[])
+                 AS t(uuid, sort_order)) AS data
+           WHERE ns.node_uuid = data.uuid""",
+        uuids, orders,
+    )
 
 
 # ── Задача #4: drill-down /history ────────────────────────────────

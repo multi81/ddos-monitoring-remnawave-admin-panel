@@ -5,8 +5,15 @@ JSON — с no-store, через jsonable_encoder.
 """
 from __future__ import annotations
 
+import hmac
+import hashlib
+import time
+
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+
+import logging
+_log = logging.getLogger("ddos_monitoring.routes")
 
 _NO_STORE = {"Cache-Control": "private, no-store", "Pragma": "no-cache"}
 
@@ -16,7 +23,7 @@ def _json(payload: dict, status: int = 200) -> JSONResponse:
 
 
 def build_router(ctx):
-    from fastapi import APIRouter, Depends, HTTPException, Body
+    from fastapi import APIRouter, Depends, HTTPException, Body, Request
 
     from web.backend.core.plugin_api import auth_deps
 
@@ -39,16 +46,48 @@ def build_router(ctx):
         res = await AgentReceiver(ctx).handle(payload)
         return _json(res, status=200 if res.get("saved") else 400)
 
-    @router.get("/agent/config", summary="Агент: динамическая конфигурация (без сессии)",
+    @router.get("/agent/config", summary="Агент: динамическая конфигурация (HMAC, без сессии)",
                 include_in_schema=False)
-    async def agent_config():
-        """Публичный endpoint для агентов. Возвращает top_ips_n."""
+    async def agent_config(request: Request):
+        """Аутентификация агента: HMAC SHA256 над `node_uuid|ts`, секрет — `agent_secret`.
+
+        Headers:
+            X-Node-Uuid: UUID ноды
+            X-Ts: unix timestamp (сек)
+            X-Sig: hex(HMAC-SHA256(secret, f"{node_uuid}|{ts}"))
+
+        Stale-window 60 сек (см. agent_receiver.STALE_WINDOW_S).
+        Ответ: {"top_ips_n": N} где N — настройка из plugin_settings, fallback 0.
+        """
+        from .secret import get_agent_secret
+        from .agent_receiver import STALE_WINDOW_S
+
+        node_uuid = (request.headers.get("X-Node-Uuid") or "").strip()
+        ts_raw = (request.headers.get("X-Ts") or "").strip()
+        sig = (request.headers.get("X-Sig") or "").strip().lower()
+        if not node_uuid or not ts_raw or not sig:
+            return _json({"error": "missing_auth_headers"}, status=401)
+        try:
+            ts = int(ts_raw)
+        except (TypeError, ValueError):
+            return _json({"error": "bad_ts"}, status=401)
+        if abs(int(time.time()) - ts) > STALE_WINDOW_S:
+            return _json({"error": "stale"}, status=401)
+        try:
+            secret = await get_agent_secret(ctx)
+        except RuntimeError:
+            return _json({"error": "not_configured"}, status=503)
+        msg = f"{node_uuid}|{ts}".encode()
+        expect = hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expect, sig):
+            return _json({"error": "bad_sig"}, status=401)
         try:
             row = await ctx.db.fetchrow(
                 "SELECT value FROM plugin_settings WHERE key = 'top_ips_n'"
             )
             n = int(row["value"]) if row else 0
-        except Exception:
+        except Exception as e:
+            _log.warning("agent_config: read top_ips_n failed: %s", e)
             n = 0
         return _json({"top_ips_n": n})
 

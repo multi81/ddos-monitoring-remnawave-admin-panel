@@ -122,11 +122,23 @@ async def test_set_node_order_updates_sort_order():
     ]
     await data.set_node_order(ctx, order)
 
-    # Проверяем что execute вызывался с UPDATE
-    assert len(db._executed) == 2
-    for sql, args in db._executed:
-        assert "UPDATE" in sql.upper()
-        assert "sort_order" in sql.lower()
+    # Батч UPDATE: один execute (вместо N+1).
+    assert len(db._executed) == 1, (
+        f"ожидался один batch execute, получено {len(db._executed)}: "
+        f"{[s for s, _ in db._executed]}"
+    )
+    sql, args = db._executed[0]
+    assert "UPDATE" in sql.upper()
+    assert "sort_order" in sql.lower()
+    # UNNEST с двумя массивами
+    assert "UNNEST" in sql
+    assert len(args) == 2
+    uuids_arg, orders_arg = args
+    assert list(uuids_arg) == [
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+    ]
+    assert list(orders_arg) == [0, 1]
 
 
 @pytest.mark.asyncio

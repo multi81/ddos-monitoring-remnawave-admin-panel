@@ -4,7 +4,7 @@
 Установка — через exec_script канала агентов панели; скан — по маркеру версии.
 """
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.2.1"
 
 _AGENT_TEMPLATE = '''#!/usr/bin/env python3
 """ddos-agent {version} — лёгкий сборщик метрик ноды для DDoS-мониторинга панели.
@@ -14,6 +14,7 @@ _AGENT_TEMPLATE = '''#!/usr/bin/env python3
 import hashlib
 import hmac
 import json
+import sys
 import time
 import urllib.request
 
@@ -230,6 +231,43 @@ def _agent_secret():
     if len(value) < 32:
         raise RuntimeError("agent secret is not configured")
     return value
+
+
+_FETCH_INTERVAL_S = 300
+_fetch_prev_ts = 0
+
+
+def _fetch_config():
+    """Подтянуть с панели настройки (top_ips_n и пр.) раз в _FETCH_INTERVAL_S.
+
+    Аутентификация — HMAC SHA256 над `node_uuid|ts`, секрет — agent_secret.
+    Stale-window на стороне панели 60 сек.
+    """
+    global TOP_IPS_N, _fetch_prev_ts
+    now = int(time.time())
+    if now - _fetch_prev_ts < _FETCH_INTERVAL_S:
+        return
+    _fetch_prev_ts = now
+    try:
+        ts = int(time.time())
+        sig = hmac.new(_agent_secret().encode(),
+                       f"{NODE_UUID}|{ts}".encode(),
+                       hashlib.sha256).hexdigest()
+        req = urllib.request.Request(
+            PANEL_URL.rstrip("/") + "/api/v2/plugins/ddos-monitoring/agent/config",
+            headers={"X-Node-Uuid": NODE_UUID, "X-Ts": str(ts),
+                     "X-Sig": sig,
+                     "User-Agent": "ddos-agent/%s" % VERSION})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode())
+        new_n = int(data.get("top_ips_n", 0))
+        if new_n >= 0:
+            TOP_IPS_N = new_n
+    except Exception as e:
+        # Если панель недоступна/secret отключен/неверный sig — оставляем
+        # прежний TOP_IPS_N (по умолчанию 0 = все IP, что для случая
+        # ошибки безопасно только если значение уже было проверено).
+        sys.stderr.write(f"ddos-agent: _fetch_config failed: {e}\n")
 
 
 def report(metrics):

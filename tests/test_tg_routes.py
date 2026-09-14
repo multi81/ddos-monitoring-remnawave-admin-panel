@@ -61,6 +61,7 @@ def _build(monkeypatch, ctx):
     fastapi_mod.Depends = lambda dep: None
     fastapi_mod.HTTPException = type("HTTPException", (Exception,), {})
     fastapi_mod.Body = lambda *a, **k: None
+    fastapi_mod.Request = type("Request", (), {})
 
     fake_plugin_api = types.ModuleType("web.backend.core.plugin_api")
 

@@ -100,8 +100,8 @@ async def agent_status_impl(ctx) -> dict:
             if not uuid:
                 continue
             out[uuid] = _node_info_from_report(uuid, row.get("name"), AR)
-    except Exception:  # noqa: BLE001 — fallback ниже всё равно спасёт
-        pass
+    except Exception as e:  # noqa: BLE001 — fallback ниже всё равно спасёт
+        _log.warning("agent_status: panel_api failed: %s", e)
 
     # 2) Fallback — прямой SQL к таблице nodes. Если uuid есть в БД, но
     # не пришёл из panel_api, добавляем с online=False.
@@ -123,8 +123,8 @@ async def agent_status_impl(ctx) -> dict:
                 info["has_agent_token"] = bool(row["has_token"])
                 info["is_connected"] = bool(row["is_connected"])
                 out[uuid] = info
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        _log.warning("agent_status: SQL fallback failed: %s", e, exc_info=True)
 
     return {"agent_version": AGENT_VERSION, "nodes": out}
 
@@ -347,7 +347,4 @@ def register_agent_routes(router, *, ctx, Body, permission_factory):
                   "agent_version": AGENT_VERSION}
         _log.info("ddos-install: summary installed=%d unknown=%d errors=%d",
                   len(installed), len(unknown), len(errors))
-        return result
-        if unknown:
-            result["error"] = "unknown_nodes"
         return result

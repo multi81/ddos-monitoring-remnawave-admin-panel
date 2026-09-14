@@ -58,6 +58,7 @@ def _build_with_fake_deps(monkeypatch):
     fastapi_mod.Depends = lambda dep: ("dep", dep)
     fastapi_mod.HTTPException = type("HTTPException", (Exception,), {})
     fastapi_mod.Body = lambda *a, **k: None  # фаза 2.5: TG-роуты
+    fastapi_mod.Request = type("Request", (), {})
     enc_mod = types.ModuleType("fastapi.encoders")
     enc_mod.jsonable_encoder = lambda x: x
     resp_mod = types.ModuleType("fastapi.responses")
@@ -94,7 +95,7 @@ def test_every_route_declares_permission(monkeypatch):
 
     # Список публичных endpoint'ов — авторизация через HMAC (см. agent_receiver.py).
     # Эти намеренно БЕЗ require_permission().
-    PUBLIC_PATHS = {"/agent/report"}
+    PUBLIC_PATHS = {"/agent/report", "/agent/config"}
 
     for path, fn, _summary in router.routes:
         if path in PUBLIC_PATHS:

@@ -79,6 +79,8 @@ def test_compiled_template_runs_first_cycle_without_nameerror():
         "report": lambda m: (_ for _ in ()).throw(KeyboardInterrupt()),
         "time": type("T", (), {"sleep": lambda s: None})(),
         "_net_prev": {},
+        "_fetch_config": lambda: None,  # HMAC-config fetch (no-op in test)
+        "INTERVAL_S": 0,
         "Exception": Exception,
     }
     code = "def main():\n" + main_body
