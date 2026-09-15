@@ -386,5 +386,11 @@ fi
 pkill -f '/usr/local/bin/ddos-agent' >/dev/null 2>&1 || true
 sleep 1
 systemctl start ddos-agent
-echo "installed {AGENT_VERSION}"
+START_RC=$?
+sleep 2
+# Диагностика: что случилось после старта
+DDOS_STATUS=$(systemctl is-active ddos-agent 2>&1)
+DDOS_PID=$(pgrep -f '/usr/local/bin/ddos-agent' || echo NONE)
+DDOS_VER=$(head -1 /usr/local/bin/ddos-agent 2>&1)
+echo "installed {AGENT_VERSION} start_rc=$START_RC active=$DDOS_STATUS pid=$DDOS_PID marker=$DDOS_VER"
 """
