@@ -129,6 +129,30 @@ async def agent_status_impl(ctx) -> dict:
     return {"agent_version": AGENT_VERSION, "nodes": out}
 
 
+async def _purge_ghost_nodes(ctx) -> int:
+    """Удалить из ddos_monitoring_* ноды, которых больше нет в public.nodes.
+
+    Без этого удалённые из Remnawave ноды остаются 'призраками' в UI плагина
+    с пустым именем и offline-статусом. Клинер тихий: при ошибке просто
+    возвращает 0, чтобы не блокировать основной /agent/status.
+    """
+    try:
+        db = getattr(ctx, "db", None)
+        if db is None:
+            return 0
+        rows = await db.fetch(
+            "DELETE FROM ddos_monitoring_agent_status "
+            "WHERE node_uuid NOT IN (SELECT uuid::text FROM public.nodes) "
+            "RETURNING node_uuid")
+        # node_state чистим отдельным запросом чтобы не зависеть от CASCADE
+        await db.execute(
+            "DELETE FROM ddos_monitoring_node_state "
+            "WHERE node_uuid NOT IN (SELECT uuid::text FROM public.nodes)")
+        return len(rows)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def register_agent_routes(router, *, ctx, Body, permission_factory):
     """Регистрация в PluginAPIRouter плагина.
 
@@ -140,6 +164,8 @@ def register_agent_routes(router, *, ctx, Body, permission_factory):
 
     @router.get("/agent/status", summary="Статус ddos-agent по нодам (ddos:view)")
     async def agent_status(_admin: object = Depends(permission_factory("ddos", "view"))):
+        # Чистим призраков (ноды удалённые из Remnawave но оставшиеся в плагине)
+        await _purge_ghost_nodes(ctx)
         return await agent_status_impl(ctx)
 
     @router.get("/agent/ui", summary="HTML секции «Агент на нодах» (ddos:view)")
